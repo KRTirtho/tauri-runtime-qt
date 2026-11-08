@@ -3,7 +3,8 @@
 //! Qt must only be used on the thread that created the `QApplication`, between
 //! [`app::init`](crate::app::init) and [`app::shutdown`](crate::app::shutdown). Every safe entry
 //! point checks this with [`ensure`] (and panics on misuse), so no call can reach Qt from the
-//! wrong thread or after it's gone.
+//! wrong thread or after it's gone. The application is created at most once per process, so
+//! handles that outlive `shutdown` stay unusable.
 //!
 //! The two entry points meant for other threads (`app::dispatch` and
 //! `webengine::Responder::respond`) instead hold a read lock on [`ALIVE`] while they hand work to
@@ -24,9 +25,10 @@ thread_local! {
   static CALLBACK_DEPTH: Cell<u32> = const { Cell::new(0) };
 }
 
-/// Whether the application exists (any thread may read it).
+/// Whether the `QApplication` exists (any thread may read it).
 static ALIVE: RwLock<bool> = RwLock::new(false);
-/// Whether some thread owns the application.
+/// Whether some thread has called `init`. Never reset: after `shutdown` the application can't be
+/// created again, so Qt handles that outlived it can never pass [`ensure`] again.
 static OWNED: AtomicBool = AtomicBool::new(false);
 
 /// Whether this is the main thread and the application is running.
@@ -44,16 +46,21 @@ pub(crate) fn ensure() {
   }
 }
 
-/// Make the current thread the main thread. Panics if another thread already is.
+/// Make the current thread the main thread, before the `QApplication` is created. Panics if
+/// another thread already is, or if the application was shut down.
 #[track_caller]
 pub(crate) fn start() {
   if is_running_here() {
     return;
   }
   if OWNED.swap(true, Ordering::AcqRel) {
-    panic!("qtshim: `app::init` was already called on another thread");
+    panic!("qtshim: `app::init` was already called (on another thread, or before `app::shutdown`)");
   }
   RUNNING_HERE.with(|r| r.set(true));
+}
+
+/// Let other threads hand work to the application, once the `QApplication` exists.
+pub(crate) fn set_alive() {
   *ALIVE.write().unwrap_or_else(PoisonError::into_inner) = true;
 }
 
@@ -83,7 +90,6 @@ pub(crate) fn stop() {
   }
   *ALIVE.write().unwrap_or_else(PoisonError::into_inner) = false;
   RUNNING_HERE.with(|r| r.set(false));
-  OWNED.store(false, Ordering::Release);
 }
 
 /// Run `f` if the application is alive, keeping it alive meanwhile. For use from any thread.
@@ -112,6 +118,15 @@ mod tests {
   fn dispatch_without_app_drops_the_closure() {
     assert!(!app::is_running());
     assert!(!app::dispatch(|| unreachable!()));
+  }
+
+  #[test]
+  #[should_panic(expected = "`app::init` was already called")]
+  fn the_application_is_created_once() {
+    // Only flips the flags: no `QApplication` is involved.
+    super::start();
+    super::stop();
+    super::start();
   }
 
   #[test]

@@ -151,6 +151,19 @@ window.runSelfTest = async function (list) {
     assert(tree.includes('New file <Ctrl+N>'), tree);
     return 'renamed to "New file"';
   });
+  await check('swapping the window menu replaces the menubar', async () => {
+    const { Menu } = window.__TAURI__.menu;
+    const swap = await Menu.new({ items: [{ text: 'Swapped', items: [{ id: 'swap-only', text: 'Only item' }] }] });
+    const prev = await swap.setAsWindowMenu();
+    await sleep(100); // let Qt delete the old menubar
+    let tree = await invoke('menu_tree');
+    assert(tree.includes('Only item') && !tree.includes('Auto save'), 'after swap:\n' + tree);
+    await prev.setAsWindowMenu();
+    await sleep(100);
+    tree = await invoke('menu_tree');
+    assert(tree.includes('Auto save') && !tree.includes('Only item'), 'after restore:\n' + tree);
+    return 'swapped to a new menu and back';
+  });
   await check('context menu from JS (Menu.popup)', async () => {
     const { Menu } = window.__TAURI__.menu;
     const menu = await Menu.new({ items: [{ id: 'ctx-reload', text: 'Reload' }, { id: 'ctx-inspect', text: 'Inspect', accelerator: 'F12' }] });

@@ -209,9 +209,8 @@ impl<T: UserEvent> WindowDispatch<T> for QtWindowDispatcher<T> {
   /// The window's `QWidget*`; `tauri` installs muda's Qt menubar on it.
   fn qt_window(&self) -> Result<*mut std::ffi::c_void> {
     self
-      .with(|w| w.window.widget().as_ptr().map(|p| p.as_ptr() as usize))?
+      .with(|w| w.window.widget_ptr().as_ptr() as usize)
       .map(|p| p as *mut std::ffi::c_void)
-      .ok_or(Error::WindowNotFound)
   }
 
   fn window_handle(&self) -> std::result::Result<WindowHandle<'_>, raw_window_handle::HandleError> {

@@ -8,6 +8,7 @@
 #include <QDBusMessage>
 #include <QGuiApplication>
 #include <QList>
+#include <QPointer>
 #include <QScreen>
 #include <QStyleHints>
 #include <QVariantMap>
@@ -30,6 +31,18 @@ static QList<void (*)()> &shutdownHooks() {
 void registerShutdownHook(void (*hook)()) {
   if (!shutdownHooks().contains(hook))
     shutdownHooks().append(hook);
+}
+
+void deleteTopLevelWidgets() {
+  QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+  // The list also holds windows owned by other widgets (e.g. a menubar's QMenus, which are popup
+  // windows), and deleting their parent deletes them too; QPointer skips those.
+  QList<QPointer<QWidget>> widgets;
+  for (QWidget *w : QApplication::topLevelWidgets())
+    widgets.append(w);
+  for (const QPointer<QWidget> &w : std::as_const(widgets))
+    delete w.data();
+  QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
 }
 } // namespace qs
 
@@ -96,27 +109,17 @@ void qs_app_shutdown(void) {
   for (auto it = shutdownHooks().crbegin(); it != shutdownHooks().crend(); ++it)
     (*it)();
   shutdownHooks().clear();
-  QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
-  for (QWidget *w : QApplication::topLevelWidgets())
-    delete w;
-  QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+  deleteTopLevelWidgets();
   g_event_fn = nullptr;
   delete qApp;
 }
 
-void qs_post(qs_fn f, void *ud) {
-  if (!QCoreApplication::instance()) {
-    f(ud);
-    return;
-  }
-  QMetaObject::invokeMethod(QCoreApplication::instance(), [f, ud] { f(ud); },
-                            Qt::QueuedConnection);
+void qs_dispatch(qs_fn f, void *ud) {
+  if (QCoreApplication *app = QCoreApplication::instance())
+    QMetaObject::invokeMethod(app, [f, ud] { f(ud); }, Qt::QueuedConnection);
 }
 
-void qs_dispatch(qs_fn f, void *ud) {
-  QMetaObject::invokeMethod(QCoreApplication::instance(), [f, ud] { f(ud); },
-                            Qt::QueuedConnection);
-}
+void qs_post(qs_fn f, void *ud) { qs_dispatch(f, ud); }
 
 int qs_app_color_scheme(void) {
   switch (QGuiApplication::styleHints()->colorScheme()) {

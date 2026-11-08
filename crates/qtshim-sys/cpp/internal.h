@@ -85,4 +85,8 @@ void fillScreen(QScreen *s, QsScreen *out);
 // Run at qs_app_shutdown, latest registered first, before the QApplication is deleted.
 void registerShutdownHook(void (*hook)());
 
+// Delete every top-level widget now (and whatever was already deleteLater'd). Only for teardown,
+// outside the event loop.
+void deleteTopLevelWidgets();
+
 } // namespace qs
