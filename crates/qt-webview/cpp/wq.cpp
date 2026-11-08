@@ -35,6 +35,7 @@
 #include <QWebEngineDesktopMediaRequest>
 #include <QWebEngineDownloadRequest>
 #include <QWebEngineFullScreenRequest>
+#include <QWebEngineHistory>
 #include <QWebEngineHttpRequest>
 #include <QWebEngineLoadingInfo>
 #include <QWebEngineNewWindowRequest>
@@ -51,6 +52,7 @@
 #include <QWebEngineUrlSchemeHandler>
 #include <QWebEngineView>
 #include <QWidget>
+#include <QtWebEngineCore/qtwebenginecoreglobal.h>
 #include <QWindow>
 
 #ifdef WQ_HAVE_QPA
@@ -649,8 +651,12 @@ static void connectPage(WqView *v) {
                      }
                    });
   QObject::connect(page, &QWebEnginePage::renderProcessTerminated, page,
-                   [page](QWebEnginePage::RenderProcessTerminationStatus status, int) {
-                     if (status != QWebEnginePage::NormalTerminationStatus)
+                   [v, page](QWebEnginePage::RenderProcessTerminationStatus status, int code) {
+                     Ev ev(WQ_EV_VIEW_CRASHED, v->win->id, v->id);
+                     ev.e.a = static_cast<int>(status);
+                     ev.e.b = code;
+                     // Unhandled abnormal exits reload the page, like a browser tab would.
+                     if (ev.fire() != 1 && status != QWebEnginePage::NormalTerminationStatus)
                        QTimer::singleShot(0, page,
                                           [page] { page->triggerAction(QWebEnginePage::Reload); });
                    });
@@ -729,6 +735,12 @@ void wq_engine_add_flags(const char *flags) {
     g_flags += ' ' + QByteArray(flags);
 }
 int wq_engine_started(void) { return g_engineStarted ? 1 : 0; }
+
+const char *wq_engine_version(void) {
+  static const QByteArray v = QByteArray(qWebEngineVersion()) + " (Chromium " +
+                              qWebEngineChromiumVersion() + ")";
+  return v.constData();
+}
 
 void wq_set_proxy(int type, const char *host, uint16_t port) {
   if (type == 0 || !host)
@@ -1342,14 +1354,29 @@ void wq_view_reload(WqView *v) {
   if (v->dead)
     return;
  v->page->triggerAction(QWebEnginePage::Reload); }
+// Chromium's history-manipulation intervention makes *browser*-initiated Back/Forward skip
+// entries a page added without a user gesture (e.g. SPA routers calling pushState), so
+// triggerAction(Back) can silently do nothing while canGoBack() is true. App webviews expect
+// the page's own history semantics (WebKitGTK/WebView2 behave that way), so navigate from the
+// renderer, in an isolated world the page can't tamper with. Without JavaScript, fall back.
+static void historyGo(WqView *v, int delta) {
+  if (v->page->settings()->testAttribute(QWebEngineSettings::JavascriptEnabled)) {
+    v->page->runJavaScript(QStringLiteral("history.go(%1)").arg(delta),
+                           QWebEngineScript::ApplicationWorld);
+    return;
+  }
+  v->page->triggerAction(delta < 0 ? QWebEnginePage::Back : QWebEnginePage::Forward);
+}
 void wq_view_back(WqView *v) {
   if (v->dead)
     return;
- v->page->triggerAction(QWebEnginePage::Back); }
+  historyGo(v, -1);
+}
 void wq_view_forward(WqView *v) {
   if (v->dead)
     return;
- v->page->triggerAction(QWebEnginePage::Forward); }
+  historyGo(v, 1);
+}
 void wq_view_set_zoom(WqView *v, double f) {
   if (v->dead)
     return;
@@ -1359,6 +1386,16 @@ void wq_view_set_background(WqView *v, uint8_t r, uint8_t g, uint8_t b, uint8_t 
     return;
 
   v->page->setBackgroundColor(QColor(r, g, b, a));
+}
+int wq_view_can_go_back(WqView *v) {
+  if (v->dead)
+    return 0;
+  return v->page->history()->canGoBack() ? 1 : 0;
+}
+int wq_view_can_go_forward(WqView *v) {
+  if (v->dead)
+    return 0;
+  return v->page->history()->canGoForward() ? 1 : 0;
 }
 
 void wq_view_add_init_script(WqView *v, const char *js, int main_frame_only) {

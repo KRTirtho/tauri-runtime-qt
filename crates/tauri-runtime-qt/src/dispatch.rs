@@ -10,12 +10,12 @@ use qt_webview::{WindowFlag, window_state as ws};
 use raw_window_handle::{RawWindowHandle, WindowHandle};
 use tauri_runtime::{
   Cookie, Error, Icon, ProgressBarState, ProgressBarStatus, ResizeDirection, Result,
-  UserAttentionType, UserEvent, WebviewDispatch, WebviewEventId, WindowDispatch, WindowEventId,
+  UserAttentionType, UserEvent, WebviewDispatch, WindowDispatch,
   dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize, Position, Rect, Size},
   monitor::Monitor,
   webview::{DetachedWebview, PendingWebview},
   window::{
-    CursorIcon, DetachedWindow, PendingWindow, RawWindow, WebviewEvent, WindowEvent, WindowId,
+    CursorIcon, DetachedWindow, PendingWindow, RawWindow, WindowId,
     WindowSizeConstraints,
   },
 };
@@ -23,7 +23,7 @@ use tauri_utils::{Theme, config::Color};
 use url::Url;
 
 use crate::{
-  Context, MainState, Qt, QtWebview, QtWindowBuilder, SendWrapper, WebviewEntry, WebviewKind,
+  Context, MainState, QtRuntime, QtWebview, QtWindowBuilder, SendWrapper, WebviewEntry, WebviewKind,
   WindowEntry, close_requested, color_scheme, create_webview, create_window, current_theme,
   destroy_window, rates, util,
 };
@@ -91,7 +91,7 @@ impl<T: UserEvent> QtWindowDispatcher<T> {
 }
 
 impl<T: UserEvent> WindowDispatch<T> for QtWindowDispatcher<T> {
-  type Runtime = Qt<T>;
+  type Runtime = QtRuntime<T>;
   type WindowBuilder = QtWindowBuilder;
 
   fn run_on_main_thread<F: FnOnce() + Send + 'static>(&self, f: F) -> Result<()> {
@@ -101,10 +101,6 @@ impl<T: UserEvent> WindowDispatch<T> for QtWindowDispatcher<T> {
     } else {
       self.context.post(move |_| f())
     }
-  }
-
-  fn on_window_event<F: Fn(&WindowEvent) + Send + 'static>(&self, f: F) -> WindowEventId {
-    self.context.add_window_listener(self.window_id, Box::new(f))
   }
 
   // --- getters ---------------------------------------------------------------------------
@@ -201,12 +197,12 @@ impl<T: UserEvent> WindowDispatch<T> for QtWindowDispatcher<T> {
   }
 
   /// Qt windows aren't GTK windows.
-  fn gtk_window(&self) -> Result<gtk::ApplicationWindow> {
+  fn gtk_window(&self) -> Result<*mut std::ffi::c_void> {
     Err(util::unsupported("gtk_window"))
   }
 
   /// Qt windows aren't GTK windows.
-  fn default_vbox(&self) -> Result<gtk::Box> {
+  fn default_vbox(&self) -> Result<*mut std::ffi::c_void> {
     Err(util::unsupported("default_vbox"))
   }
 
@@ -252,9 +248,9 @@ impl<T: UserEvent> WindowDispatch<T> for QtWindowDispatcher<T> {
 
   fn create_window<F: Fn(RawWindow) + Send + 'static>(
     &mut self,
-    pending: PendingWindow<T, Qt<T>>,
+    pending: PendingWindow<T, QtRuntime<T>>,
     _after_window_creation: Option<F>,
-  ) -> Result<DetachedWindow<T, Qt<T>>> {
+  ) -> Result<DetachedWindow<T, QtRuntime<T>>> {
     let pending = SendWrapper(pending);
     self
       .context
@@ -263,8 +259,8 @@ impl<T: UserEvent> WindowDispatch<T> for QtWindowDispatcher<T> {
 
   fn create_webview(
     &mut self,
-    pending: PendingWebview<T, Qt<T>>,
-  ) -> Result<DetachedWebview<T, Qt<T>>> {
+    pending: PendingWebview<T, QtRuntime<T>>,
+  ) -> Result<DetachedWebview<T, QtRuntime<T>>> {
     let id = self.window_id;
     let pending = SendWrapper(pending);
     self.context.run_on_main(move |st| {
@@ -592,12 +588,6 @@ fn remove_webview<T: UserEvent>(st: &MainState<T>, window_id: WindowId, id: u32)
   drop(removed);
   st.webviews.borrow_mut().remove(&id);
   st.protocols.borrow_mut().remove(&id);
-  st.context
-    .shared
-    .webview_listeners
-    .lock()
-    .unwrap()
-    .remove(&id);
 }
 
 fn reparent_webview<T: UserEvent>(
@@ -639,7 +629,7 @@ fn reparent_webview<T: UserEvent>(
 }
 
 impl<T: UserEvent> WebviewDispatch<T> for QtWebviewDispatcher<T> {
-  type Runtime = Qt<T>;
+  type Runtime = QtRuntime<T>;
 
   fn run_on_main_thread<F: FnOnce() + Send + 'static>(&self, f: F) -> Result<()> {
     if std::thread::current().id() == self.context.shared.main_thread {
@@ -650,17 +640,13 @@ impl<T: UserEvent> WebviewDispatch<T> for QtWebviewDispatcher<T> {
     }
   }
 
-  fn on_webview_event<F: Fn(&WebviewEvent) + Send + 'static>(&self, f: F) -> WebviewEventId {
-    self.context.add_webview_listener(self.webview_id, Box::new(f))
-  }
-
   /// Passes a [`QtWebview`] (raw `QWebEngineView*` / `QWebEnginePage*`).
-  fn with_webview<F: FnOnce(Box<dyn std::any::Any>) + Send + 'static>(&self, f: F) -> Result<()> {
+  fn with_webview<F: FnOnce(QtWebview) + Send + 'static>(&self, f: F) -> Result<()> {
     self.act(move |_, v| {
-      f(Box::new(QtWebview {
+      f(QtWebview {
         view: v.view.qt_view(),
         page: v.view.qt_page(),
-      }))
+      })
     })
   }
 
@@ -710,6 +696,22 @@ impl<T: UserEvent> WebviewDispatch<T> for QtWebviewDispatcher<T> {
 
   fn reload(&self) -> Result<()> {
     self.act(|_, v| v.view.reload())
+  }
+
+  fn go_back(&self) -> Result<()> {
+    self.act(|_, v| v.view.go_back())
+  }
+
+  fn can_go_back(&self) -> Result<bool> {
+    self.with(|_, v| v.view.can_go_back())
+  }
+
+  fn go_forward(&self) -> Result<()> {
+    self.act(|_, v| v.view.go_forward())
+  }
+
+  fn can_go_forward(&self) -> Result<bool> {
+    self.with(|_, v| v.view.can_go_forward())
   }
 
   fn print(&self) -> Result<()> {

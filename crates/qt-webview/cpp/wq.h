@@ -47,6 +47,8 @@ enum {
   WQ_EV_VIEW_DOWNLOAD_DONE = 27, // s1 = url, s2 = path, a = success
   WQ_EV_VIEW_DRAG = 28,        // a = 0 enter,1 over,2 drop,3 leave; b,c = physical x,y;
                                // s1 = '\n'-joined paths; return 1 to swallow the event
+  WQ_EV_VIEW_CRASHED = 29,     // renderer died: a = QWebEnginePage::RenderProcessTerminationStatus,
+                               // b = exit code; return 1 if handled (otherwise the page reloads)
   WQ_EV_ABOUT_TO_BLOCK = 40,   // the event loop is about to wait
 };
 
@@ -88,6 +90,8 @@ int wq_register_scheme(const char *name, uint32_t flags);
 // Append Chromium command line flags. Only effective before the web engine starts.
 void wq_engine_add_flags(const char *flags);
 int wq_engine_started(void);
+// "<QtWebEngine version> (Chromium <version>)", static string.
+const char *wq_engine_version(void);
 // type: 0 none/system, 1 http, 2 socks5. Only effective before the web engine starts.
 void wq_set_proxy(int type, const char *host, uint16_t port);
 int wq_app_exec(void);
@@ -225,6 +229,8 @@ void wq_view_load_html(WqView *v, const char *html, const char *base_url);
 void wq_view_reload(WqView *v);
 void wq_view_back(WqView *v);
 void wq_view_forward(WqView *v);
+int wq_view_can_go_back(WqView *v);
+int wq_view_can_go_forward(WqView *v);
 void wq_view_set_zoom(WqView *v, double factor);
 void wq_view_set_background(WqView *v, uint8_t r, uint8_t g, uint8_t b, uint8_t a);
 void wq_view_add_init_script(WqView *v, const char *js, int main_frame_only);

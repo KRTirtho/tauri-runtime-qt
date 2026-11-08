@@ -25,6 +25,10 @@ const { listen, emit } = window.__TAURI__.event;
 if (location.search.includes('child')) {
   document.getElementById('h').textContent = 'Second window';
   invoke('whoami').then(label => emit('child-ready', label));
+} else if (location.search.includes('popup')) {
+  document.getElementById('h').textContent = 'Popup';
+  // Only works if the runtime connected this popup to the page that called window.open().
+  invoke('whoami').then(label => window.opener.postMessage({ popup: label }, '*'));
 } else {
   runSelfTest();
 }
@@ -61,6 +65,11 @@ async function runSelfTest() {
 
   await check('page origin', () => location.href);
   await check('engine', () => navigator.userAgent);
+  await check('webview_version()', async () => {
+    const v = await invoke('engine');
+    assert(v.includes('Chromium'), v);
+    return v;
+  });
   await check('invoke (sync command)', async () => {
     const r = await invoke('greet', { name: 'Qt' });
     assert(r.includes('Hello, Qt'), r);
@@ -122,6 +131,26 @@ async function runSelfTest() {
     const labels = (await getAllWebviewWindows()).map(w => w.label);
     assert(!labels.includes('second'), 'still open: ' + labels);
     return `child identified as "${label}", remaining windows: ${labels}`;
+  });
+  await check('window.open() popup connected to its opener', async () => {
+    const reply = new Promise(res => window.addEventListener('message', e => {
+      if (e.data && e.data.popup) res(e.data.popup);
+    }));
+    const popup = window.open('index.html?popup', '_blank', 'width=420,height=320');
+    assert(popup, 'window.open returned null');
+    const label = await reply;
+    assert(label.startsWith('popup-'), label);
+    await (await WebviewWindow.getByLabel(label)).close();
+    return `popup "${label}" posted back through window.opener`;
+  });
+  await check('history: can_go_back / go_back', async () => {
+    history.pushState({}, '', '#step');
+    assert(await invoke('can_go_back') === true, 'can_go_back after pushState');
+    const popped = new Promise(res => window.addEventListener('popstate', res, { once: true }));
+    await invoke('go_back');
+    await popped;
+    assert(location.hash === '', 'hash after go_back: ' + location.hash);
+    return 'pushState -> can_go_back=true -> go_back restored ' + location.href;
   });
   await check('WebRTC data channel', async () => {
     const a = new RTCPeerConnection(), b = new RTCPeerConnection();

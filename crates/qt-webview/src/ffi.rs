@@ -68,6 +68,7 @@ unsafe extern "C" {
   pub fn wq_register_scheme(name: *const c_char, flags: u32) -> c_int;
   pub fn wq_engine_add_flags(flags: *const c_char);
   pub fn wq_engine_started() -> c_int;
+  pub fn wq_engine_version() -> *const c_char;
   pub fn wq_set_proxy(kind: c_int, host: *const c_char, port: u16);
   pub fn wq_app_exec() -> c_int;
   pub fn wq_app_quit(code: c_int);
@@ -133,6 +134,8 @@ unsafe extern "C" {
   pub fn wq_view_reload(v: *mut WqView);
   pub fn wq_view_back(v: *mut WqView);
   pub fn wq_view_forward(v: *mut WqView);
+  pub fn wq_view_can_go_back(v: *mut WqView) -> c_int;
+  pub fn wq_view_can_go_forward(v: *mut WqView) -> c_int;
   pub fn wq_view_set_zoom(v: *mut WqView, f: f64);
   pub fn wq_view_set_background(v: *mut WqView, r: u8, g: u8, b: u8, a: u8);
   pub fn wq_view_add_init_script(v: *mut WqView, js: *const c_char, main_only: c_int);

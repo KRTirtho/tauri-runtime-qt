@@ -265,7 +265,7 @@ impl WindowBuilder for QtWindowBuilder {
     self
   }
   /// Qt windows cannot be made transient for a GTK window; this is ignored.
-  fn transient_for(self, _parent: &impl gtk::glib::IsA<gtk::Window>) -> Self {
+  fn transient_for(self, _parent: *mut std::ffi::c_void) -> Self {
     log::warn!("transient_for(gtk::Window) is not supported by the Qt runtime");
     self
   }

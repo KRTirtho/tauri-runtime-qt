@@ -85,6 +85,7 @@ pub enum EventKind {
   ViewDownload,
   ViewDownloadDone,
   ViewDrag,
+  ViewCrashed,
   AboutToBlock,
   Unknown(i32),
 }
@@ -108,6 +109,7 @@ impl EventKind {
       26 => ViewDownload,
       27 => ViewDownloadDone,
       28 => ViewDrag,
+      29 => ViewCrashed,
       40 => AboutToBlock,
       k => Unknown(k),
     }
@@ -267,6 +269,13 @@ pub fn add_chromium_flags(flags: &str) {
 
 pub fn engine_started() -> bool {
   unsafe { ffi::wq_engine_started() != 0 }
+}
+
+/// "<QtWebEngine version> (Chromium <version>)".
+pub fn engine_version() -> String {
+  unsafe { CStr::from_ptr(ffi::wq_engine_version()) }
+    .to_string_lossy()
+    .into_owned()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -913,6 +922,12 @@ impl View {
   }
   pub fn go_forward(&self) {
     unsafe { ffi::wq_view_forward(self.p()) }
+  }
+  pub fn can_go_back(&self) -> bool {
+    unsafe { ffi::wq_view_can_go_back(self.p()) != 0 }
+  }
+  pub fn can_go_forward(&self) -> bool {
+    unsafe { ffi::wq_view_can_go_forward(self.p()) != 0 }
   }
   pub fn set_zoom(&self, factor: f64) {
     unsafe { ffi::wq_view_set_zoom(self.p(), factor) }

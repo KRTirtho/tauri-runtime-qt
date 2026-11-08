@@ -5,14 +5,15 @@
 //! and windows are native Wayland (or X11) windows owned by Qt.
 //!
 //! ```ignore
-//! tauri::Builder::<tauri_runtime_qt::Qt<tauri::EventLoopMessage>>::new()
+//! tauri::Builder::default()
+//!   .runtime(tauri_runtime_qt::Qt::default())
 //!   .run(tauri::generate_context!())
 //!   .expect("error while running tauri application");
 //! ```
 //!
-//! GTK is still initialised and driven by the same GLib main loop, so GTK-based Tauri pieces
-//! (tray icons, file dialogs) keep working. APIs that hand out GTK objects (`gtk_window`,
-//! `default_vbox`) return an error; window menus therefore aren't available.
+//! The runtime doesn't use GTK. Qt runs on the GLib event loop, so GTK-based pieces an app adds
+//! (e.g. `rfd` dialogs) still get their events, but APIs that hand out GTK objects
+//! (`gtk_window`, `default_vbox`) return an error and no GTK version is declared.
 
 use std::{
   any::Any,
@@ -34,12 +35,13 @@ use qt_webview::{Event, EventKind, Profile, Reply, SchemeFlags, View, ViewOption
 use raw_window_handle::{DisplayHandle, RawDisplayHandle};
 use tauri_runtime::{
   DeviceEventFilter, Error, EventLoopProxy, ExitRequestedEventAction, Result, RunEvent, Runtime,
-  RuntimeHandle, RuntimeInitArgs, UserEvent, WebviewEventId, WindowEventId,
+  RuntimeHandle, RuntimeInitArgs, UserEvent,
   dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize},
   monitor::Monitor,
   webview::{
-    DetachedWebview, DownloadEvent, NewWindowFeatures, NewWindowOpener, NewWindowResponse,
-    PageLoadEvent, PendingWebview, PermissionKind, PermissionResponse, WebviewIpcHandler,
+    DetachedWebview, DownloadEvent, NewWindowFeatures, NewWindowResponse, PageLoadEvent,
+    PendingWebview, PermissionKind, PermissionResponse, WebContentProcessTermination,
+    WebContentProcessTerminationReason, WebviewIpcHandler,
   },
   window::{
     DetachedWindow, DetachedWindowWebview, DragDropEvent, PendingWindow, RawWindow, WebviewEvent,
@@ -56,8 +58,62 @@ mod window_builder;
 pub use dispatch::{QtWebviewDispatcher, QtWindowDispatcher};
 pub use window_builder::QtWindowBuilder;
 
-/// Schemes Tauri always uses on Linux. Registering them up front keeps them working even if the
-/// first webview doesn't declare them (QtWebEngine needs schemes before the engine starts).
+/// Selects and configures the Qt runtime. Pass it to `tauri::Builder::runtime`.
+///
+/// ```ignore
+/// tauri::Builder::default().runtime(tauri_runtime_qt::Qt::default().chromium_flags("--ignore-gpu-blocklist"));
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Qt {
+  /// Extra Chromium command-line flags, appended to `QTWEBENGINE_CHROMIUM_FLAGS`.
+  pub chromium_flags: Vec<String>,
+  /// Expose the Chromium DevTools protocol on this port (`--remote-debugging-port`).
+  pub remote_debugging_port: Option<u16>,
+}
+
+impl Qt {
+  /// Append Chromium command-line flags (space separated).
+  #[must_use]
+  pub fn chromium_flags(mut self, flags: impl Into<String>) -> Self {
+    self.chromium_flags.push(flags.into());
+    self
+  }
+
+  /// Expose the Chromium DevTools protocol on `port`.
+  #[must_use]
+  pub fn remote_debugging_port(mut self, port: u16) -> Self {
+    self.remote_debugging_port = Some(port);
+    self
+  }
+}
+
+impl<T: UserEvent> tauri_runtime::RuntimeInitAttrs<T> for Qt {
+  type Runtime = QtRuntime<T>;
+}
+
+impl<T: UserEvent> From<Qt> for tauri_runtime::dynamic::DynRuntimeInitAttrs<T> {
+  fn from(attrs: Qt) -> Self {
+    Self::new(attrs)
+  }
+}
+
+/// Qt-specific webview attributes (`Runtime::RuntimeWebviewAttributes`).
+#[derive(Debug, Clone, Default)]
+pub struct QtWebviewAttributes {}
+
+/// The webview that asked for a new window; pass it to the new webview's builder
+/// (`WebviewWindowBuilder::window_features`) so the popup is connected to its opener.
+#[derive(Debug, Clone)]
+pub struct QtWindowOpener {
+  /// The opener's webview id.
+  pub webview_id: u32,
+  /// The URL the opener asked to open.
+  pub url: String,
+}
+
+/// Schemes Tauri uses on Linux. `RuntimeInitArgs::custom_schemes` lists every scheme the app
+/// registers; these are added in case an older `tauri` leaves some out (QtWebEngine needs every
+/// scheme before the engine starts).
 const DEFAULT_SCHEMES: &[&str] = &["tauri", "ipc", "asset", "isolation"];
 
 type ProtocolHandler = dyn Fn(
@@ -68,8 +124,6 @@ type ProtocolHandler = dyn Fn(
   + Sync
   + 'static;
 
-type WindowListener = Box<dyn Fn(&WindowEvent) + Send>;
-type WebviewListener = Box<dyn Fn(&WebviewEvent) + Send>;
 
 // ---------------------------------------------------------------------------------------------
 // shared (thread-safe) context
@@ -79,9 +133,6 @@ pub(crate) struct Shared {
   alive: AtomicBool,
   next_window_id: AtomicU32,
   next_webview_id: AtomicU32,
-  next_listener_id: AtomicU32,
-  window_listeners: Mutex<HashMap<WindowId, BTreeMap<WindowEventId, WindowListener>>>,
-  webview_listeners: Mutex<HashMap<u32, BTreeMap<WebviewEventId, WebviewListener>>>,
   /// Unity launcher state: badge count, progress, desktop file.
   launcher: Mutex<(Option<i64>, Option<f64>, Option<String>)>,
   app_id: Option<String>,
@@ -151,54 +202,6 @@ impl<T: UserEvent> Context<T> {
       }
     });
     Ok(())
-  }
-
-  pub(crate) fn next_listener_id(&self) -> u32 {
-    self.shared.next_listener_id.fetch_add(1, Ordering::Relaxed)
-  }
-
-  pub(crate) fn add_window_listener(&self, id: WindowId, f: WindowListener) -> WindowEventId {
-    let lid = self.next_listener_id();
-    self
-      .shared
-      .window_listeners
-      .lock()
-      .unwrap()
-      .entry(id)
-      .or_default()
-      .insert(lid, f);
-    lid
-  }
-
-  pub(crate) fn add_webview_listener(&self, id: u32, f: WebviewListener) -> WebviewEventId {
-    let lid = self.next_listener_id();
-    self
-      .shared
-      .webview_listeners
-      .lock()
-      .unwrap()
-      .entry(id)
-      .or_default()
-      .insert(lid, f);
-    lid
-  }
-
-  fn call_window_listeners(&self, id: WindowId, event: &WindowEvent) {
-    let listeners = self.shared.window_listeners.lock().unwrap();
-    if let Some(l) = listeners.get(&id) {
-      for f in l.values() {
-        f(event);
-      }
-    }
-  }
-
-  fn call_webview_listeners(&self, id: u32, event: &WebviewEvent) {
-    let listeners = self.shared.webview_listeners.lock().unwrap();
-    if let Some(l) = listeners.get(&id) {
-      for f in l.values() {
-        f(event);
-      }
-    }
   }
 
   pub(crate) fn update_launcher(
@@ -271,14 +274,15 @@ impl WindowEntry {
 pub(crate) struct WebviewMeta<T: UserEvent> {
   label: String,
   window_id: Arc<Mutex<WindowId>>,
-  ipc_handler: Option<WebviewIpcHandler<T, Qt<T>>>,
+  ipc_handler: Option<WebviewIpcHandler<T, QtRuntime<T>>>,
   navigation_handler: Option<Box<dyn Fn(&Url) -> bool + Send>>,
   new_window_handler:
-    Option<Box<dyn Fn(Url, NewWindowFeatures) -> NewWindowResponse + Send>>,
+    Option<Box<dyn Fn(Url, NewWindowFeatures<T, QtRuntime<T>>) -> NewWindowResponse + Send + Sync>>,
   title_handler: Option<Box<dyn Fn(String) + Send>>,
   page_load_handler: Option<Box<dyn Fn(Url, PageLoadEvent) + Send>>,
   download_handler: Option<Arc<dyn Fn(DownloadEvent) -> bool + Send + Sync>>,
   permission_handler: Option<Box<dyn Fn(PermissionKind) -> PermissionResponse + Send + Sync>>,
+  terminate_handler: Option<Box<dyn Fn(WebContentProcessTermination) + Send>>,
 }
 
 pub(crate) struct MainState<T: UserEvent> {
@@ -349,11 +353,7 @@ impl<T: UserEvent> MainState<T> {
     let Some(label) = self.window_label(id) else {
       return;
     };
-    self.emit(RunEvent::WindowEvent {
-      label,
-      event: event.clone(),
-    });
-    self.context.call_window_listeners(id, &event);
+    self.emit(RunEvent::WindowEvent { label, event });
   }
 
   fn emit_webview_event(&self, webview_id: u32, event: WebviewEvent) {
@@ -362,9 +362,8 @@ impl<T: UserEvent> MainState<T> {
     };
     self.emit(RunEvent::WebviewEvent {
       label: meta.label.clone(),
-      event: event.clone(),
+      event,
     });
-    self.context.call_webview_listeners(webview_id, &event);
   }
 
   fn dispatcher_for(&self, webview_id: u32, meta: &WebviewMeta<T>) -> QtWebviewDispatcher<T> {
@@ -388,21 +387,12 @@ pub(crate) fn close_requested<T: UserEvent>(st: &MainState<T>, id: WindowId) {
     return;
   }
   let (tx, rx) = channel();
-  st.context
-    .call_window_listeners(id, &WindowEvent::CloseRequested { signal_tx: tx.clone() });
-  st.emit_window_event_no_listeners(id, WindowEvent::CloseRequested { signal_tx: tx });
+  st.emit_window_event(id, WindowEvent::CloseRequested { signal_tx: tx });
   if !matches!(rx.try_recv(), Ok(true)) {
     destroy_window(st, id);
   }
 }
 
-impl<T: UserEvent> MainState<T> {
-  fn emit_window_event_no_listeners(&self, id: WindowId, event: WindowEvent) {
-    if let Some(label) = self.window_label(id) {
-      self.emit(RunEvent::WindowEvent { label, event });
-    }
-  }
-}
 
 pub(crate) fn destroy_window<T: UserEvent>(st: &MainState<T>, id: WindowId) {
   let Ok(mut windows) = st.windows.try_borrow_mut() else {
@@ -428,15 +418,6 @@ pub(crate) fn destroy_window<T: UserEvent>(st: &MainState<T>, id: WindowId) {
     label,
     event: WindowEvent::Destroyed,
   });
-  st.context
-    .call_window_listeners(id, &WindowEvent::Destroyed);
-  st.context.shared.window_listeners.lock().unwrap().remove(&id);
-  {
-    let mut l = st.context.shared.webview_listeners.lock().unwrap();
-    for wid in webview_ids {
-      l.remove(&wid);
-    }
-  }
 
   if now_empty {
     exit_requested(st, None);
@@ -460,8 +441,8 @@ pub(crate) fn exit_requested<T: UserEvent>(st: &MainState<T>, code: Option<i32>)
 
 pub(crate) fn create_window<T: UserEvent>(
   st: &MainState<T>,
-  pending: PendingWindow<T, Qt<T>>,
-) -> Result<DetachedWindow<T, Qt<T>>> {
+  pending: PendingWindow<T, QtRuntime<T>>,
+) -> Result<DetachedWindow<T, QtRuntime<T>>> {
   let PendingWindow {
     label,
     window_builder: b,
@@ -561,11 +542,13 @@ pub(crate) fn create_window<T: UserEvent>(
   let mut detached_webview = None;
   if let Some(pending_webview) = webview {
     let use_https_scheme = pending_webview.webview_attributes.use_https_scheme;
+    let devtools = pending_webview.webview_attributes.devtools;
     match create_webview(st, id, WebviewKind::WindowContent, pending_webview) {
       Ok(webview) => {
         detached_webview = Some(DetachedWindowWebview {
           webview,
           use_https_scheme,
+          devtools,
         })
       }
       Err(e) => {
@@ -610,8 +593,8 @@ pub(crate) fn create_webview<T: UserEvent>(
   st: &MainState<T>,
   window_id: WindowId,
   kind: WebviewKind,
-  pending: PendingWebview<T, Qt<T>>,
-) -> Result<DetachedWebview<T, Qt<T>>> {
+  pending: PendingWebview<T, QtRuntime<T>>,
+) -> Result<DetachedWebview<T, QtRuntime<T>>> {
   let PendingWebview {
     label,
     webview_attributes: attrs,
@@ -624,6 +607,9 @@ pub(crate) fn create_webview<T: UserEvent>(
     on_page_load_handler,
     download_handler,
     permission_request_handler,
+    on_web_content_process_terminate_handler,
+    opener,
+    runtime_specific_attributes: _,
     ..
   } = pending;
 
@@ -706,6 +692,11 @@ pub(crate) fn create_webview<T: UserEvent>(
   for script in &attrs.initialization_scripts {
     view.add_init_script(&script.script, script.for_main_frame_only);
   }
+  // QtWebEngine binds no DevTools shortcut of its own, so (like wry) inject Tauri's toggle.
+  #[cfg(any(debug_assertions, feature = "devtools"))]
+  if attrs.devtools.unwrap_or(true) {
+    view.add_init_script(&tauri_runtime::webview::devtools_shortcut_script(), true);
+  }
 
   let window_id_cell = Arc::new(Mutex::new(window_id));
   st.webviews.borrow_mut().insert(
@@ -720,6 +711,7 @@ pub(crate) fn create_webview<T: UserEvent>(
       page_load_handler: on_page_load_handler,
       download_handler,
       permission_handler: permission_request_handler,
+      terminate_handler: on_web_content_process_terminate_handler,
     }),
   );
   st.protocols.borrow_mut().insert(
@@ -731,7 +723,11 @@ pub(crate) fn create_webview<T: UserEvent>(
   );
 
   log::debug!("webview {webview_id} ({label}) loading {url}");
-  if url != "about:blank" {
+  // A popup created for an opener gets its content through `QWebEngineNewWindowRequest::openIn`
+  // when the new-window handler returns `Create`.
+  if let Some(opener) = &opener {
+    log::debug!("webview {webview_id} ({label}) opened by webview {}", opener.webview_id);
+  } else if url != "about:blank" {
     view.load_url(&url, None);
   }
 
@@ -939,8 +935,9 @@ fn handle_view_event<T: UserEvent>(st: &MainState<T>, ev: &Event) -> Reply {
       let features = NewWindowFeatures::new(
         size,
         position,
-        NewWindowOpener {
-          webview: opener_placeholder(),
+        QtWindowOpener {
+          webview_id,
+          url: ev.s1.to_string(),
         },
       );
       match h(url, features) {
@@ -1021,6 +1018,24 @@ fn handle_view_event<T: UserEvent>(st: &MainState<T>, ev: &Event) -> Reply {
       }
       Reply::default()
     }
+    EventKind::ViewCrashed => {
+      let Some(h) = &meta.terminate_handler else {
+        return Reply::default();
+      };
+      let reason = match ev.a {
+        0 => WebContentProcessTerminationReason::Normal,
+        1 => WebContentProcessTerminationReason::Abnormal,
+        2 => WebContentProcessTerminationReason::Crashed,
+        3 => WebContentProcessTerminationReason::Killed,
+        _ => WebContentProcessTerminationReason::Unknown,
+      };
+      h(WebContentProcessTermination {
+        reason,
+        error_code: Some(ev.b as i32),
+        error_string: None,
+      });
+      Reply::code(1)
+    }
     EventKind::ViewDrag => {
       let position = PhysicalPosition::new(ev.b as f64, ev.c as f64);
       let paths = || -> Vec<std::path::PathBuf> {
@@ -1055,15 +1070,6 @@ fn handle_view_event<T: UserEvent>(st: &MainState<T>, ev: &Event) -> Reply {
     }
     _ => Reply::default(),
   }
-}
-
-/// tauri-runtime requires a `webkit2gtk::WebView` as the new-window opener on Linux. It's only
-/// meaningful for WebKitGTK; we hand out a lazily created, never-loaded instance.
-fn opener_placeholder() -> webkit2gtk::WebView {
-  thread_local! {
-    static OPENER: webkit2gtk::WebView = webkit2gtk::WebView::new();
-  }
-  OPENER.with(|w| w.clone())
 }
 
 fn handle_scheme<T: UserEvent>(req: qt_webview::SchemeRequest, responder: qt_webview::Responder) {
@@ -1119,15 +1125,15 @@ fn handle_scheme<T: UserEvent>(req: qt_webview::SchemeRequest, responder: qt_web
 // ---------------------------------------------------------------------------------------------
 // Runtime
 
-/// The Qt runtime. `T` is Tauri's event loop message type (`tauri::EventLoopMessage`).
-pub struct Qt<T: UserEvent> {
+/// The Qt runtime. Selected with [`Qt`]; `T` is Tauri's event loop message type.
+pub struct QtRuntime<T: UserEvent> {
   context: Context<T>,
   _not_send: PhantomData<*const ()>,
 }
 
-impl<T: UserEvent> fmt::Debug for Qt<T> {
+impl<T: UserEvent> fmt::Debug for QtRuntime<T> {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    f.debug_struct("Qt").field("context", &self.context).finish()
+    f.debug_struct("QtRuntime").field("context", &self.context).finish()
   }
 }
 
@@ -1186,20 +1192,34 @@ pub struct QtWebview {
   pub page: *mut std::ffi::c_void,
 }
 
-impl<T: UserEvent> Qt<T> {
-  fn init(args: RuntimeInitArgs) -> Result<Self> {
-    if gtk::init().is_err() {
-      log::warn!("failed to initialise GTK; GTK-based plugins (tray, dialogs) won't work");
-    }
-    let info = qt_webview::init(args.app_id.as_deref());
+impl<T: UserEvent> QtRuntime<T> {
+  fn init(args: RuntimeInitArgs<Qt>) -> Result<Self> {
+    let RuntimeInitArgs {
+      app_id,
+      identifier,
+      custom_schemes,
+      runtime_init_attrs: attrs,
+    } = args;
+    let app_id = app_id.or_else(|| (!identifier.is_empty()).then_some(identifier));
+    let info = qt_webview::init(app_id.as_deref());
     log::debug!("Qt runtime: {info}");
     if !info.contains("Glib") {
       log::warn!(
         "Qt is not using the GLib event dispatcher ({info}); GTK-based plugins won't receive events"
       );
     }
-    for scheme in DEFAULT_SCHEMES {
+    for scheme in DEFAULT_SCHEMES
+      .iter()
+      .copied()
+      .chain(custom_schemes.iter().map(String::as_str))
+    {
       qt_webview::register_scheme(scheme, SchemeFlags::APP);
+    }
+    for flags in &attrs.chromium_flags {
+      qt_webview::add_chromium_flags(flags);
+    }
+    if let Some(port) = attrs.remote_debugging_port {
+      qt_webview::add_chromium_flags(&format!("--remote-debugging-port={port}"));
     }
 
     let context = Context {
@@ -1208,11 +1228,8 @@ impl<T: UserEvent> Qt<T> {
         alive: AtomicBool::new(true),
         next_window_id: AtomicU32::new(1),
         next_webview_id: AtomicU32::new(1),
-        next_listener_id: AtomicU32::new(1),
-        window_listeners: Default::default(),
-        webview_listeners: Default::default(),
         launcher: Default::default(),
-        app_id: args.app_id,
+        app_id,
       }),
       _marker: PhantomData,
     };
@@ -1283,7 +1300,7 @@ pub(crate) fn display_from_send(h: SendHandle) -> Option<RawDisplayHandle> {
 }
 
 impl<T: UserEvent> RuntimeHandle<T> for QtHandle<T> {
-  type Runtime = Qt<T>;
+  type Runtime = QtRuntime<T>;
 
   fn create_proxy(&self) -> QtEventProxy<T> {
     QtEventProxy {
@@ -1297,9 +1314,9 @@ impl<T: UserEvent> RuntimeHandle<T> for QtHandle<T> {
 
   fn create_window<F: Fn(RawWindow) + Send + 'static>(
     &self,
-    pending: PendingWindow<T, Qt<T>>,
+    pending: PendingWindow<T, QtRuntime<T>>,
     _after_window_creation: Option<F>,
-  ) -> Result<DetachedWindow<T, Qt<T>>> {
+  ) -> Result<DetachedWindow<T, QtRuntime<T>>> {
     let pending = SendWrapper(pending);
     self
       .context
@@ -1309,8 +1326,8 @@ impl<T: UserEvent> RuntimeHandle<T> for QtHandle<T> {
   fn create_webview(
     &self,
     window_id: WindowId,
-    pending: PendingWebview<T, Qt<T>>,
-  ) -> Result<DetachedWebview<T, Qt<T>>> {
+    pending: PendingWebview<T, QtRuntime<T>>,
+  ) -> Result<DetachedWebview<T, QtRuntime<T>>> {
     let pending = SendWrapper(pending);
     self.context.run_on_main(move |st| {
       create_webview(st, window_id, WebviewKind::WindowChild, pending.into_inner())
@@ -1363,6 +1380,15 @@ impl<T: UserEvent> RuntimeHandle<T> for QtHandle<T> {
   }
 
   fn set_device_event_filter(&self, _filter: DeviceEventFilter) {}
+
+  /// Custom schemes are served as `<scheme>://localhost` (QtWebEngine registers them natively).
+  fn custom_scheme_url(&self, scheme: &str, _https: bool) -> String {
+    format!("{scheme}://localhost")
+  }
+
+  fn webview_version(&self) -> Result<String> {
+    Ok(qt_webview::engine_version())
+  }
 }
 
 pub(crate) fn primary_monitor() -> Option<Monitor> {
@@ -1396,17 +1422,21 @@ impl<V> SendWrapper<V> {
   }
 }
 
-impl<T: UserEvent> Runtime<T> for Qt<T> {
+impl<T: UserEvent> Runtime<T> for QtRuntime<T> {
   type WindowDispatcher = QtWindowDispatcher<T>;
   type WebviewDispatcher = QtWebviewDispatcher<T>;
   type Handle = QtHandle<T>;
   type EventLoopProxy = QtEventProxy<T>;
+  type RuntimeWebviewAttributes = QtWebviewAttributes;
+  type Webview = QtWebview;
+  type RuntimeInitAttrs = Qt;
+  type WindowOpener = QtWindowOpener;
 
-  fn new(args: RuntimeInitArgs) -> Result<Self> {
+  fn new(args: RuntimeInitArgs<Qt>) -> Result<Self> {
     Self::init(args)
   }
 
-  fn new_any_thread(args: RuntimeInitArgs) -> Result<Self> {
+  fn new_any_thread(args: RuntimeInitArgs<Qt>) -> Result<Self> {
     Self::init(args)
   }
 
