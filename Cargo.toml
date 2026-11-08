@@ -2,7 +2,9 @@
 resolver = "3"
 members = [
   "crates/qtshim-sys",
+  "crates/qtshim-sys/systest",
   "crates/qtshim",
+  "crates/qt-test-harness",
   "crates/tauri-runtime-qt",
   "examples/qt-app",
 ]

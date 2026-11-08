@@ -67,6 +67,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <optional>
+
+#include <sys/mman.h>
 
 using namespace qs;
 
@@ -85,6 +88,35 @@ QHash<quint64, QsView *> g_views;
 QHash<QWebEnginePage *, QsView *> g_pageViews;
 QHash<QString, bool> g_permissionMemo; // answers given through the built-in prompt
 const char kViewHeader[] = "X-Qs-View";
+const char kSubresourceHeader[] = "X-Qs-Subresource"; // set for requests that aren't navigations
+
+// A scheme request handed to Rust (as QsJob*).
+struct JobHandle {
+  QPointer<QWebEngineUrlRequestJob> job;
+  bool subresource = false;
+  qint64 suffix = -1; // N of a `Range: bytes=-N` request
+};
+
+// N of a `bytes=-N` (suffix) Range header value, or -1.
+qint64 suffixRange(const QByteArray &range) {
+  const QByteArray r = range.trimmed();
+  if (!r.startsWith("bytes=-") || r.contains(','))
+    return -1;
+  bool ok = false;
+  const qint64 n = r.mid(7).trimmed().toLongLong(&ok);
+  return ok && n > 0 ? n : -1;
+}
+
+// Fail a scheme request. QWebEngineUrlRequestJob::fail() shows the error page for navigations,
+// but for fetch() (Qt 6.11) it produces a response whose body never completes, so the page's
+// `await r.text()` hangs. A redirect to a URL nothing can load makes fetch, XHR and elements
+// fail with a network error instead.
+void failJob(QWebEngineUrlRequestJob *job, bool subresource, QWebEngineUrlRequestJob::Error e) {
+  if (subresource)
+    job->redirect(QUrl(QStringLiteral("qtshim-error:request-failed")));
+  else
+    job->fail(e);
+}
 
 // Serves a partial body as if it were the whole resource, so that Qt (which applies the
 // request's Range header itself) ends up sending exactly the bytes the handler produced.
@@ -116,6 +148,38 @@ private:
   qint64 m_start, m_total;
 };
 
+// The largest request body a scheme handler receives; larger requests fail.
+constexpr qint64 kMaxRequestBody = qint64(256) << 20;
+
+// Read a scheme request's whole body.
+//
+// Qt's body device (QtWebEngineCore's ResourceRequestBody, Qt 6.7 to at least 6.11) only works
+// when one read() call drains every element: a partial read of a bytes element re-copies it from
+// its start on the next call, a data-pipe element (Chromium streams bodies over 16 KiB) is
+// reopened on every call and skipped afterwards, and size() is 0. readAll() reads in 16 KiB
+// chunks, so it returned corrupted bodies or never finished. So: one read() into a buffer larger
+// than any accepted body. The buffer is a lazily committed anonymous mapping, so only the pages
+// actually written use memory. Returns nullopt if the body is larger than kMaxRequestBody.
+std::optional<QByteArray> readRequestBody(QIODevice *dev) {
+  if (!dev->isOpen() && !dev->open(QIODevice::ReadOnly))
+    return QByteArray();
+  const size_t cap = size_t(kMaxRequestBody) + 1; // + 1 to tell "exactly the limit" from "more"
+  void *buf = mmap(nullptr, cap, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
+                   -1, 0);
+  if (buf == MAP_FAILED)
+    return std::nullopt;
+  const qint64 n = dev->read(static_cast<char *>(buf), qint64(cap));
+  std::optional<QByteArray> body;
+  if (n <= 0)
+    body = QByteArray();
+  else if (n <= kMaxRequestBody)
+    body = QByteArray(static_cast<const char *>(buf), n);
+  else
+    qWarning("qtshim: request body over %lld bytes, failing the request", (long long)kMaxRequestBody);
+  munmap(buf, cap);
+  return body;
+}
+
 // Tags every request of a page so the profile-wide scheme handler knows which view asked.
 // Runs browser-side, so pages cannot spoof it.
 class ViewTagger : public QWebEngineUrlRequestInterceptor {
@@ -123,7 +187,20 @@ public:
   ViewTagger(quint64 id, QObject *parent)
       : QWebEngineUrlRequestInterceptor(parent), m_id(QByteArray::number(id)) {}
   void interceptRequest(QWebEngineUrlRequestInfo &info) override {
+    // Only our scheme handlers read the tags; don't leak them to http(s) servers.
+    if (!g_schemes.contains(info.requestUrl().scheme().toLatin1()))
+      return;
     info.setHttpHeader(kViewHeader, m_id);
+    using I = QWebEngineUrlRequestInfo;
+    switch (info.resourceType()) {
+    case I::ResourceTypeMainFrame:
+    case I::ResourceTypeSubFrame:
+    case I::ResourceTypeNavigationPreloadMainFrame:
+    case I::ResourceTypeNavigationPreloadSubFrame:
+      break;
+    default:
+      info.setHttpHeader(kSubresourceHeader, "1");
+    }
   }
 
 private:
@@ -135,12 +212,9 @@ public:
   using QWebEngineUrlSchemeHandler::QWebEngineUrlSchemeHandler;
 
   void requestStarted(QWebEngineUrlRequestJob *job) override {
-    if (!g_scheme) {
-      job->fail(QWebEngineUrlRequestJob::UrlNotFound);
-      return;
-    }
     quint64 view = 0;
-    bool hasOrigin = false;
+    qint64 suffix = -1;
+    bool hasOrigin = false, subresource = false;
     QByteArray headers;
     const auto reqHeaders = job->requestHeaders();
     for (auto it = reqHeaders.cbegin(); it != reqHeaders.cend(); ++it) {
@@ -148,8 +222,14 @@ public:
         view = it.value().toULongLong();
         continue;
       }
+      if (it.key().compare(kSubresourceHeader, Qt::CaseInsensitive) == 0) {
+        subresource = true;
+        continue;
+      }
       if (it.key().compare("origin", Qt::CaseInsensitive) == 0)
         hasOrigin = true;
+      if (it.key().compare("range", Qt::CaseInsensitive) == 0)
+        suffix = suffixRange(it.value());
       headers += it.key() + ": " + it.value() + '\n';
     }
     // Scheme handlers don't receive an Origin header; reconstruct it from the initiator
@@ -160,15 +240,23 @@ public:
                                                  QUrl::RemoveFragment | QUrl::StripTrailingSlash)
                                   .toUtf8() +
                  '\n';
+    if (!g_scheme) {
+      failJob(job, subresource, QWebEngineUrlRequestJob::UrlNotFound);
+      return;
+    }
     QByteArray body;
     if (QIODevice *dev = job->requestBody()) {
-      if (!dev->isOpen())
-        dev->open(QIODevice::ReadOnly);
-      body = dev->readAll();
+      std::optional<QByteArray> read = readRequestBody(dev);
+      if (!read) {
+        failJob(job, subresource, QWebEngineUrlRequestJob::RequestFailed);
+        return;
+      }
+      body = std::move(*read);
     }
     const QByteArray method = job->requestMethod();
     const QByteArray url = job->requestUrl().toEncoded();
-    auto *handle = new QPointer<QWebEngineUrlRequestJob>(job);
+    auto *handle = new JobHandle{job, subresource, suffix};
+    CallbackScope scope;
     g_scheme(g_schemeUd, reinterpret_cast<QsJob *>(handle), view, method.constData(),
              url.constData(), headers.constData(),
              reinterpret_cast<const uint8_t *>(body.constData()),
@@ -211,6 +299,12 @@ QString permissionLabel(QWebEnginePermission::PermissionType t) {
 struct QsWindow : public QWidget {
   quint64 id;
   bool resizable = true;
+  // Wanted decorations and title-bar buttons. Qt's setWindowFlags drops FramelessWindowHint when
+  // CustomizeWindowHint comes with button hints, so the buttons are only applied as flags while
+  // the window is decorated (see applyFrame).
+  bool frameless = false;
+  bool customButtons = false; // some button was changed: use CustomizeWindowHint
+  bool closable = true, minimizable = true, maximizable = true;
   QSize minS{-1, -1}, maxS{-1, -1};
   QList<QsView *> views;
   bool cursorHidden = false;
@@ -246,13 +340,28 @@ struct QsWindow : public QWidget {
       show();
   }
 
-  void ensureCustomButtons() {
-    if (windowFlags() & Qt::CustomizeWindowHint)
+  // Apply `frameless` and the button settings as window flags, keeping the window visible.
+  void applyFrame() {
+    constexpr Qt::WindowFlags frame =
+        Qt::FramelessWindowHint | Qt::CustomizeWindowHint | Qt::WindowTitleHint |
+        Qt::WindowSystemMenuHint | Qt::WindowCloseButtonHint | Qt::WindowMinimizeButtonHint |
+        Qt::WindowMaximizeButtonHint;
+    Qt::WindowFlags f = windowFlags() & ~frame;
+    if (frameless) {
+      f |= Qt::FramelessWindowHint;
+    } else if (customButtons) {
+      f |= Qt::CustomizeWindowHint | Qt::WindowTitleHint | Qt::WindowSystemMenuHint;
+      if (closable)
+        f |= Qt::WindowCloseButtonHint;
+      if (minimizable)
+        f |= Qt::WindowMinimizeButtonHint;
+      if (maximizable)
+        f |= Qt::WindowMaximizeButtonHint;
+    }
+    if (f == windowFlags())
       return;
     const bool visible = isVisible();
-    setWindowFlags(windowFlags() | Qt::CustomizeWindowHint | Qt::WindowTitleHint |
-                   Qt::WindowSystemMenuHint | Qt::WindowCloseButtonHint |
-                   Qt::WindowMinimizeButtonHint | Qt::WindowMaximizeButtonHint);
+    setWindowFlags(f);
     if (visible)
       show();
   }
@@ -333,6 +442,7 @@ struct QsView {
   bool dead = false; // Qt side torn down (its window died); struct kept until Rust drops it
   bool fill = false;
   bool dragHandler = false;
+  bool devtoolsAllowed = false;
   bool dragActive = false;
   bool fullscreen = false;
   QRect savedGeometry;
@@ -425,8 +535,8 @@ private:
     ev.e.c = phys(p.y(), s);
     ev.s1 = paths.join('\n').toUtf8();
     const bool swallow = ev.fire() == 1;
-    if (!swallow)
-      return false;
+    if (!swallow || !v) // v is cleared if the handler destroyed the view
+      return swallow;
     v->dragActive = de->type() != QEvent::Drop;
     de->acceptProposedAction();
     return true;
@@ -544,14 +654,15 @@ static void connectPage(QsView *v) {
                      ev.fire();
                    });
   QObject::connect(page, &QWebEnginePage::permissionRequested, page,
-                   [v](QWebEnginePermission p) {
-                     Ev ev(QS_EV_VIEW_PERMISSION, v->win->id, v->id);
+                   [id = v->id, wid = v->win->id](QWebEnginePermission p) {
+                     Ev ev(QS_EV_VIEW_PERMISSION, wid, id);
                      ev.s1 = p.origin().toEncoded();
                      ev.e.a = static_cast<int>(p.permissionType());
                      const int r = ev.fire();
+                     QsView *v = g_views.value(id); // the handler may have destroyed it
                      if (r == 1)
                        p.grant();
-                     else if (r == 0)
+                     else if (r == 0 || !v)
                        p.deny();
                      else
                        askPermission(v, p);
@@ -566,8 +677,8 @@ static void connectPage(QsView *v) {
                        req.cancel();
                    });
   QObject::connect(page, &QWebEnginePage::newWindowRequested, page,
-                   [v](QWebEngineNewWindowRequest &req) {
-                     Ev ev(QS_EV_VIEW_NEW_WINDOW, v->win->id, v->id);
+                   [id = v->id, wid = v->win->id](QWebEngineNewWindowRequest &req) {
+                     Ev ev(QS_EV_VIEW_NEW_WINDOW, wid, id);
                      ev.s1 = req.requestedUrl().toEncoded();
                      const QRect g = req.requestedGeometry();
                      ev.e.a = g.x();
@@ -580,6 +691,9 @@ static void connectPage(QsView *v) {
                        if (QsView *target = g_views.value(static_cast<quint64>(reply.i)))
                          req.openIn(target->page);
                      } else if (r == 1) {
+                       QsView *v = g_views.value(id); // the handler may have destroyed it
+                       if (!v)
+                         return;
                        auto *popup = new QWebEngineView;
                        popup->setAttribute(Qt::WA_DeleteOnClose);
                        auto *popupPage = new QWebEnginePage(v->profile->p, popup);
@@ -615,7 +729,8 @@ static void connectPage(QsView *v) {
                      ev.e.a = static_cast<int>(status);
                      ev.e.b = code;
                      // Unhandled abnormal exits reload the page, like a browser tab would.
-                     if (ev.fire() != 1 && status != QWebEnginePage::NormalTerminationStatus)
+                     if (ev.fire() != 1 && status != QWebEnginePage::NormalTerminationStatus &&
+                         g_pageViews.contains(page)) // not destroyed by the handler
                        QTimer::singleShot(0, page,
                                           [page] { page->triggerAction(QWebEnginePage::Reload); });
                    });
@@ -694,10 +809,7 @@ void qs_window_destroy(QsWindow *w) {
   for (QsView *v : views)
     teardownView(v); // the Rust View still owns the struct
   w->hide();
-  if (inEventLoop())
-    w->deleteLater();
-  else
-    delete w;
+  deleteSoon(w);
 }
 
 void qs_window_set_title(QsWindow *w, const char *t) { w->setWindowTitle(QString::fromUtf8(t)); }
@@ -749,19 +861,18 @@ uint32_t qs_window_state(QsWindow *w) {
   uint32_t s = 0;
   const auto st = w->windowState();
   const auto fl = w->windowFlags();
-  const bool custom = fl & Qt::CustomizeWindowHint;
   if (st & Qt::WindowMinimized) s |= QS_STATE_MINIMIZED;
   if (st & Qt::WindowMaximized) s |= QS_STATE_MAXIMIZED;
   if (st & Qt::WindowFullScreen) s |= QS_STATE_FULLSCREEN;
   if (w->isActiveWindow()) s |= QS_STATE_ACTIVE;
   if (w->isVisible()) s |= QS_STATE_VISIBLE;
   if (w->isEnabled()) s |= QS_STATE_ENABLED;
-  if (!(fl & Qt::FramelessWindowHint)) s |= QS_STATE_DECORATED;
+  if (!w->frameless) s |= QS_STATE_DECORATED;
   if (fl & Qt::WindowStaysOnTopHint) s |= QS_STATE_ON_TOP;
   if (w->resizable) s |= QS_STATE_RESIZABLE;
-  if (!custom || (fl & Qt::WindowCloseButtonHint)) s |= QS_STATE_CLOSABLE;
-  if (!custom || (fl & Qt::WindowMinimizeButtonHint)) s |= QS_STATE_MINIMIZABLE;
-  if (!custom || (fl & Qt::WindowMaximizeButtonHint)) s |= QS_STATE_MAXIMIZABLE;
+  if (w->closable) s |= QS_STATE_CLOSABLE;
+  if (w->minimizable) s |= QS_STATE_MINIMIZABLE;
+  if (w->maximizable) s |= QS_STATE_MAXIMIZABLE;
   return s;
 }
 
@@ -771,34 +882,39 @@ void qs_window_set_state(QsWindow *w, uint32_t which, int on) {
                                : which == QS_STATE_MAXIMIZED ? Qt::WindowMaximized
                                                              : Qt::WindowFullScreen;
   st.setFlag(flag, on != 0);
-  if (on && flag == Qt::WindowMinimized) {
+  // A hidden window keeps the state and shows with it later (like tao).
+  if (on && flag == Qt::WindowMinimized && w->isVisible()) {
     w->showMinimized();
     return;
   }
   w->setWindowState(st);
-  if (!w->isVisible() && on)
-    w->show();
 }
 
 void qs_window_set_flag(QsWindow *w, uint32_t flag, int on) {
   switch (flag) {
-  case QS_FLAG_DECORATIONS: w->setFlagKeepVisible(Qt::FramelessWindowHint, !on); break;
+  case QS_FLAG_DECORATIONS:
+    w->frameless = !on;
+    w->applyFrame();
+    break;
   case QS_FLAG_ON_TOP: w->setFlagKeepVisible(Qt::WindowStaysOnTopHint, on); break;
   case QS_FLAG_ON_BOTTOM: w->setFlagKeepVisible(Qt::WindowStaysOnBottomHint, on); break;
   case QS_FLAG_FOCUSABLE: w->setFlagKeepVisible(Qt::WindowDoesNotAcceptFocus, !on); break;
   case QS_FLAG_IGNORE_CURSOR: w->setFlagKeepVisible(Qt::WindowTransparentForInput, on); break;
   case QS_FLAG_SKIP_TASKBAR: w->setFlagKeepVisible(Qt::Tool, on); break;
   case QS_FLAG_CLOSABLE:
-    w->ensureCustomButtons();
-    w->setFlagKeepVisible(Qt::WindowCloseButtonHint, on);
+    w->customButtons = true;
+    w->closable = on;
+    w->applyFrame();
     break;
   case QS_FLAG_MINIMIZABLE:
-    w->ensureCustomButtons();
-    w->setFlagKeepVisible(Qt::WindowMinimizeButtonHint, on);
+    w->customButtons = true;
+    w->minimizable = on;
+    w->applyFrame();
     break;
   case QS_FLAG_MAXIMIZABLE:
-    w->ensureCustomButtons();
-    w->setFlagKeepVisible(Qt::WindowMaximizeButtonHint, on);
+    w->customButtons = true;
+    w->maximizable = on;
+    w->applyFrame();
     break;
   default: break;
   }
@@ -1033,6 +1149,7 @@ void qs_profile_clear_data(QsProfile *p) {
   p->p->clearHttpCache();
   p->p->clearAllVisitedLinks();
   p->p->cookieStore()->deleteAllCookies();
+  p->cookies.clear(); // deleteAllCookies doesn't emit cookieRemoved for each cookie
 }
 
 // --- views ---------------------------------------------------------------------------------
@@ -1044,6 +1161,7 @@ QsView *qs_view_new(uint64_t id, QsWindow *parent, QsProfile *profile, uint32_t 
   v->profile = profile;
   v->fill = flags & QS_VIEW_FILL;
   v->dragHandler = flags & QS_VIEW_DRAG_HANDLER;
+  v->devtoolsAllowed = flags & QS_VIEW_DEVTOOLS;
   v->view = new QWebEngineView(parent->content);
   v->page = new QsPage(profile->p, v->view);
   v->page->owner = v;
@@ -1097,13 +1215,10 @@ static void teardownView(QsView *v) {
   QObject::disconnect(v->page, nullptr, v->page, nullptr);
   v->view->hide();
   if (v->devtools)
-    inEventLoop() ? v->devtools->deleteLater() : delete v->devtools.data();
-  if (inEventLoop()) {
+    deleteSoon(v->devtools.data());
+  if (!canDeleteNow())
     v->view->setParent(nullptr); // detach so a dying window doesn't delete it twice
-    v->view->deleteLater();
-  } else {
-    delete v->view;
-  }
+  deleteSoon(v->view);
 }
 
 void qs_view_destroy(QsView *v) {
@@ -1184,18 +1299,16 @@ void qs_view_reload(QsView *v) {
   if (v->dead)
     return;
  v->page->triggerAction(QWebEnginePage::Reload); }
-// Chromium's history-manipulation intervention makes *browser*-initiated Back/Forward skip
-// entries a page added without a user gesture (e.g. SPA routers calling pushState), so
-// triggerAction(Back) can silently do nothing while canGoBack() is true. App webviews expect
-// the page's own history semantics (WebKitGTK/WebView2 behave that way), so navigate from the
-// renderer, in an isolated world the page can't tamper with. Without JavaScript, fall back.
+// Chromium's history-manipulation intervention makes Back/Forward (browser- and, since Chromium
+// ~140, also script-initiated `history.go`) skip entries a page added without a user gesture,
+// e.g. SPA routers calling pushState. App webviews expect the page's own history semantics
+// (WebKitGTK/WebView2 behave that way), so navigate to an explicit history index: Chromium only
+// applies the intervention to relative Back/Forward, not to GoToIndex.
 static void historyGo(QsView *v, int delta) {
-  if (v->page->settings()->testAttribute(QWebEngineSettings::JavascriptEnabled)) {
-    v->page->runJavaScript(QStringLiteral("history.go(%1)").arg(delta),
-                           QWebEngineScript::ApplicationWorld);
-    return;
-  }
-  v->page->triggerAction(delta < 0 ? QWebEnginePage::Back : QWebEnginePage::Forward);
+  QWebEngineHistory *h = v->page->history();
+  const int i = h->currentItemIndex() + delta;
+  if (i >= 0 && i < h->count())
+    h->goToItem(h->itemAt(i));
 }
 void qs_view_back(QsView *v) {
   if (v->dead)
@@ -1220,12 +1333,13 @@ void qs_view_set_background(QsView *v, uint8_t r, uint8_t g, uint8_t b, uint8_t 
 int qs_view_can_go_back(QsView *v) {
   if (v->dead)
     return 0;
-  return v->page->history()->canGoBack() ? 1 : 0;
+  return v->page->history()->currentItemIndex() > 0 ? 1 : 0;
 }
 int qs_view_can_go_forward(QsView *v) {
   if (v->dead)
     return 0;
-  return v->page->history()->canGoForward() ? 1 : 0;
+  QWebEngineHistory *h = v->page->history();
+  return h->currentItemIndex() + 1 < h->count() ? 1 : 0;
 }
 
 void qs_view_add_init_script(QsView *v, const char *js, int main_frame_only) {
@@ -1241,8 +1355,11 @@ void qs_view_add_init_script(QsView *v, const char *js, int main_frame_only) {
 }
 
 void qs_view_eval(QsView *v, const char *js, qs_str_fn cb, void *ud, qs_drop_fn drop) {
-  if (v->dead)
+  if (v->dead) {
+    if (drop && ud)
+      drop(ud); // the callback will never run
     return;
+  }
 
   if (!cb) {
     v->page->runJavaScript(QString::fromUtf8(js), QWebEngineScript::MainWorld);
@@ -1257,14 +1374,17 @@ void qs_view_eval(QsView *v, const char *js, qs_str_fn cb, void *ud, qs_drop_fn 
                                QJsonDocument(QJsonArray{QJsonValue::fromVariant(result)})
                                    .toJson(QJsonDocument::Compact);
                            json = json.mid(1, json.size() - 2); // strip [ ]
+                           CallbackScope scope;
                            slot->f(slot->ud, json.constData(), static_cast<size_t>(json.size()));
                          });
 }
 
-char *qs_view_url(QsView *v) { return strdup(v->page->url().toEncoded().constData()); }
+char *qs_view_url(QsView *v) {
+  return strdup(v->dead ? "" : v->page->url().toEncoded().constData());
+}
 
 void qs_view_open_devtools(QsView *v) {
-  if (v->dead)
+  if (v->dead || !v->devtoolsAllowed)
     return;
 
   if (!v->devtools) {
@@ -1306,20 +1426,20 @@ void qs_view_print(QsView *v) {
   v->view->print(printer);
 }
 
-void *qs_view_qt_view(QsView *v) { return v->view; }
-void *qs_view_qt_page(QsView *v) { return v->page; }
+void *qs_view_qt_view(QsView *v) { return v->dead ? nullptr : v->view; }
+void *qs_view_qt_page(QsView *v) { return v->dead ? nullptr : v->page; }
 
 // --- jobs ----------------------------------------------------------------------------------
 
 void qs_job_respond(QsJob *jobPtr, int status, const char *content_type, const char *headers,
                     const uint8_t *data, size_t len, int64_t range_start, int64_t range_total) {
-  auto *handle = reinterpret_cast<QPointer<QWebEngineUrlRequestJob> *>(jobPtr);
+  auto *handle = reinterpret_cast<JobHandle *>(jobPtr);
   QByteArray ct = content_type ? QByteArray(content_type) : QByteArray("text/plain");
   QByteArray hdr = headers ? QByteArray(headers) : QByteArray();
   QByteArray payload(reinterpret_cast<const char *>(data), static_cast<qsizetype>(len));
-  runOnMain([handle, status, ct, hdr, payload, range_start, range_total] {
-    std::unique_ptr<QPointer<QWebEngineUrlRequestJob>> guard(handle);
-    QWebEngineUrlRequestJob *job = handle->data();
+  runOnMain([handle, status, ct, hdr, payload, range_start, range_total]() mutable {
+    std::unique_ptr<JobHandle> guard(handle);
+    QWebEngineUrlRequestJob *job = handle->job.data();
     if (!job)
       return; // request was cancelled
     QMultiMap<QByteArray, QByteArray> extra;
@@ -1335,22 +1455,29 @@ void qs_job_respond(QsJob *jobPtr, int status, const char *content_type, const c
       // Qt computes these itself from the device.
       if (lk == "content-length" || lk == "content-range" || lk == "content-type")
         continue;
-      extra.insert(k, val);
+      extra.insert(extra.cend(), k, val); // after earlier values of the same key: keep their order
     }
     if (status >= 300 && status < 400 && !location.isEmpty()) {
       job->redirect(job->requestUrl().resolved(QUrl::fromEncoded(location)));
       return;
     }
     if (status >= 400 && payload.isEmpty()) {
-      job->fail(status == 404   ? QWebEngineUrlRequestJob::UrlNotFound
-                : status == 403 ? QWebEngineUrlRequestJob::RequestDenied
-                                : QWebEngineUrlRequestJob::RequestFailed);
+      failJob(job, handle->subresource,
+              status == 404   ? QWebEngineUrlRequestJob::UrlNotFound
+              : status == 403 ? QWebEngineUrlRequestJob::RequestDenied
+                              : QWebEngineUrlRequestJob::RequestFailed);
       return;
     }
     if (!extra.isEmpty())
       job->setAdditionalResponseHeaders(extra);
     QIODevice *dev;
-    if (status == 206 && range_start >= 0 && range_total > 0) {
+    if (handle->suffix > 0 && status < 300) {
+      // Qt (6.11) serves a `bytes=-N` request from the first N bytes of the device instead of
+      // the last N, so put the resource's last N bytes there. They're the payload's last bytes
+      // both for a 206 of that range and for a full 200 body.
+      const qint64 total = status == 206 && range_total > 0 ? range_total : payload.size();
+      dev = new RangeDevice(payload.right(qMin<qint64>(handle->suffix, payload.size())), 0, total);
+    } else if (status == 206 && range_start >= 0 && range_total > 0) {
       dev = new RangeDevice(payload, range_start, range_total);
     } else {
       auto *buf = new QBuffer;

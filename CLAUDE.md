@@ -8,10 +8,20 @@ Branches: `qt-menus` (current) adds Qt menus and builds against unreleased local
 
 ## Commands
 
+Qt/Chromium tests are heavy: run one suite at a time, capped (6 GB RAM, 3 CPUs), e.g.
+`systemd-run --user --scope -p MemoryMax=6G -p MemorySwapMax=0 -p CPUQuota=300% -- nice -n 19 cargo test ...`.
+
 ```sh
 cargo build --workspace                      # builds C++ shim (via build.rs), runtime, example
-cargo test --workspace                       # unit tests (few; most coverage is the self-test below)
-cargo test -p tauri-runtime-qt cookie_matching   # single test by name
+cargo test -p qtshim --features webengine --lib          # qtshim unit tests (no Qt)
+cargo test -p qtshim --features webengine --test qt -- 'view:'   # real-Qt cases (filter optional)
+cargo test -p tauri-runtime-qt --lib                     # runtime unit tests
+cargo test -p tauri-runtime-qt --test qt                 # runtime driven through tauri_runtime traits
+cargo test -p qtshim-sys-systest --features webengine    # FFI decls vs qtshim.h (ctest + signature check)
+cargo test -p qt-app --test e2e                          # the four QT_APP_AUTO modes, offscreen
+cargo llvm-cov -p qtshim --features webengine --summary-only   # coverage (child processes included)
+# muda's Qt backend (in ../muda):
+RUSTFLAGS="--cfg muda_qt_tests" cargo test --no-default-features --features qt --lib --test qt
 
 QT_APP_AUTO=1 cargo run -p qt-app            # end-to-end self-test in a real Tauri app; exits 0 when all checks pass
 QT_APP_AUTO=close cargo run -p qt-app        # same, but exits by closing the last window (tests ExitRequested{code: None})
@@ -20,6 +30,8 @@ QT_APP_AUTO=crash cargo run -p qt-app        # kills the renderer (chrome://kill
 cargo run -p qt-app                          # interactive (camera / screen-share buttons)
 RUST_LOG=tauri_runtime_qt=trace ...          # logs every scheme request/response and view event
 ```
+
+Qt allows one `QApplication` per process (and qtshim refuses to create it twice), so real-Qt tests are `harness = false` binaries on `crates/qt-test-harness`: each `Case` runs in its own child process on the main thread, offscreen (`QT_QPA_PLATFORM=offscreen`; WebGL and real window-manager behaviour aren't available), at most 2 at a time with one Chromium renderer each. Helpers for qtshim cases are in `crates/qtshim/tests/qt/common.rs` (`run_until`, `wait_for`, `record_events`). A bug found by a test is kept as an `.ignored()` case with a `// BUG:` comment until fixed.
 
 `examples/qt-app` is an interactive showcase (`dist/index.html`, `dist/app.js`, commands and hooks in `src/main.rs`) plus the regression suites: the self-test (`dist/selftest.js`, `runSelfTest`) and the showcase smoke test (`smokeTest` in `dist/app.js`). Each check reports through the `report` command and prints `[PASS]`/`[FAIL]` to stdout. Add a check when adding runtime behaviour.
 
@@ -55,12 +67,15 @@ In v3 the runtime delivers window/webview events only through the `RunEvent` cal
 - Scheme handlers get no `Origin` header; the shim rebuilds it from `job->initiator()` (Tauri's IPC rejects requests without it).
 - Status codes can't be set; Qt applies `Range` itself. 206 responses are served through `RangeDevice` (sparse, full-size) — parsed from `Content-Range` in `Responder::respond`.
 - Popups: Tauri's new-window handler synchronously builds the target window (`about:blank` + `opener`) and returns `Create`; `create_webview` skips loading when `opener` is set, and the shim calls `QWebEngineNewWindowRequest::openIn(target page)` before the signal returns.
-- `go_back`/`go_forward` deliberately run `history.go(±1)` in `ApplicationWorld`, not `triggerAction(Back)`: Chromium's history-manipulation intervention makes browser-initiated Back skip gesture-less `pushState` entries.
+- `go_back`/`go_forward` navigate to an explicit history index (`QWebEngineHistory::goToItem`), and `can_go_*` compare indices: Chromium's history-manipulation intervention makes relative Back/Forward (`triggerAction(Back)`, and in Chromium 140 also `history.go(-1)`) skip gesture-less `pushState` entries, but not `GoToIndex`.
+- Request bodies: Qt's body device (`requestBody()`) only works when one `read()` drains it (partial reads re-copy or skip; bodies over 16 KiB are streamed; `size()` is 0), so `readRequestBody` reads once into a lazily committed 256 MiB mapping. Larger bodies fail the request.
+- Failing a request: `job->fail()` leaves `fetch()`'s body hanging, so subresources (tagged `X-Qs-Subresource` by the interceptor) fail via a redirect to an unloadable URL; navigations still use `fail()` (error page). Both `X-Qs-*` tags are only added to custom-scheme requests and stripped before the handler.
+- Qt serves `Range: bytes=-N` from the first N bytes of the reply device, so suffix-range replies put the resource's last N bytes there (`JobHandle::suffix`).
 - Window close is always blocked in Qt (`closeEvent` → `QS_EV_WINDOW_CLOSE_REQ`); Rust decides and destroys.
 
 ### Ownership / teardown
 - `WindowEntry.webviews` is declared before `window` so views drop first. If a window is destroyed first, the shim marks its views `dead` (Qt side torn down, struct kept) and every `qs_view_*` call becomes a no-op until Rust drops the `View`.
-- Inside the event loop, Qt objects are `deleteLater`'d; outside it they're deleted immediately (deferred deletes after `exec()` returns would run during static destruction and crash).
+- Qt objects are deleted with `qs::deleteSoon`: immediately only outside the event loop *and* outside any call into Rust (`CallbackScope`, held by `Ev::fire`, menu actions, scheme handler, eval callbacks and posted closures), because Rust may destroy the very object whose signal is running; otherwise `deleteLater` in the loop, or a queued call that `process_events` runs. Event handlers that use a view after `ev.fire()` look it up again by id (`g_views`), since the handler may have destroyed it.
 - `run_return` → `teardown` drops windows, then `qtshim::app::shutdown()` runs the registered shutdown hooks (views, windows, profiles) and destroys the `QApplication`.
 
 ### GTK

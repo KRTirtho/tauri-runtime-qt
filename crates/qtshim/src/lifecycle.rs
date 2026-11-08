@@ -135,4 +135,46 @@ mod tests {
     let _guard = super::enter_callback();
     super::stop();
   }
+
+  #[test]
+  fn not_running_on_a_fresh_thread() {
+    assert!(!super::is_running_here());
+    assert!(!std::thread::spawn(super::is_running_here).join().unwrap());
+  }
+
+  #[test]
+  #[should_panic(expected = "Qt can only be used on the thread that called `app::init`")]
+  fn ensure_panics_without_init() {
+    super::ensure();
+  }
+
+  #[test]
+  fn while_alive_skips_without_app() {
+    // No unit test makes the application alive (that would race with the other tests).
+    assert_eq!(super::while_alive(|| unreachable!()), None::<()>);
+  }
+
+  #[test]
+  fn callback_guards_nest() {
+    let outer = super::enter_callback();
+    let inner = super::enter_callback();
+    drop(inner);
+    // Still inside `outer`.
+    let refused = std::panic::catch_unwind(super::stop).is_err();
+    drop(outer);
+    assert!(refused);
+    // All guards gone: `stop` only resets this thread's flags (no application here).
+    super::stop();
+    assert!(!super::is_running_here());
+  }
+
+  #[test]
+  fn callback_guard_released_on_unwind() {
+    let r = std::panic::catch_unwind(|| {
+      let _guard = super::enter_callback();
+      panic!("inside a callback");
+    });
+    assert!(r.is_err());
+    super::stop();
+  }
 }

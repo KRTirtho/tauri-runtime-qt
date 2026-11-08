@@ -21,3 +21,14 @@ log = "0.4"
 [features]
 # Enable DevTools (and the DevTools keyboard shortcut) in release builds.
 devtools = ["tauri-runtime/devtools"]
+
+[dev-dependencies]
+qt-test-harness = { path = "../qt-test-harness" }
+serde_json = "1"
+
+# Drives the runtime through the `tauri_runtime` traits with a real Qt application (offscreen),
+# one process per case (see `qt-test-harness`).
+[[test]]
+name = "qt"
+path = "tests/qt/main.rs"
+harness = false

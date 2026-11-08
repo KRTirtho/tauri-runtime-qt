@@ -564,7 +564,7 @@ pub(crate) fn create_window<T: UserEvent>(
     window.set_background(Some(c.into()));
   }
   if let Some(theme) = b.theme {
-    app::set_color_scheme(Some(color_scheme(theme)));
+    apply_theme(Some(theme));
   }
   if let Some((x, y)) = b.position {
     window.move_to(util::round(x), util::round(y));
@@ -821,7 +821,23 @@ pub(crate) fn color_scheme(theme: Theme) -> app::ColorScheme {
   }
 }
 
+thread_local! {
+  /// The theme the app asked for with `set_theme`, if any.
+  static THEME_OVERRIDE: std::cell::Cell<Option<Theme>> = const { std::cell::Cell::new(None) };
+}
+
+/// Ask Qt for `theme` (`None`: follow the system) and remember it: Qt's color scheme is only a
+/// request, which platform themes may ignore (offscreen, some Wayland desktops), and `theme()`
+/// must still report what the app set.
+pub(crate) fn apply_theme(theme: Option<Theme>) {
+  THEME_OVERRIDE.with(|t| t.set(theme));
+  app::set_color_scheme(theme.map(color_scheme));
+}
+
 pub(crate) fn current_theme() -> Theme {
+  if let Some(theme) = THEME_OVERRIDE.with(std::cell::Cell::get) {
+    return theme;
+  }
   match app::color_scheme() {
     Some(app::ColorScheme::Dark) => Theme::Dark,
     _ => Theme::Light,
@@ -1446,9 +1462,7 @@ impl<T: UserEvent> RuntimeHandle<T> for QtHandle<T> {
   }
 
   fn set_theme(&self, theme: Option<Theme>) {
-    let _ = self
-      .context
-      .post(move |_| app::set_color_scheme(theme.map(color_scheme)));
+    let _ = self.context.post(move |_| apply_theme(theme));
   }
 
   fn set_device_event_filter(&self, _filter: DeviceEventFilter) {}
@@ -1559,7 +1573,7 @@ impl<T: UserEvent> Runtime<T> for QtRuntime<T> {
   }
 
   fn set_theme(&self, theme: Option<Theme>) {
-    app::set_color_scheme(theme.map(color_scheme));
+    apply_theme(theme);
   }
 
   fn set_device_event_filter(&mut self, _filter: DeviceEventFilter) {}
@@ -1577,12 +1591,12 @@ impl<T: UserEvent> Runtime<T> for QtRuntime<T> {
       return 1;
     };
     *st.callback.borrow_mut() = Some(Box::new(callback));
+    // Ready goes first: delivered now, ahead of the events queued while windows were built
+    // before `run` (flushed right after it) and of closures other threads already queued with
+    // Qt (they run once the loop starts).
+    st.queue.borrow_mut().push_front(RunEvent::Ready);
+    st.flush();
     drop(st);
-    let _ = self.context.post(|st| {
-      // Ready goes first, ahead of events queued while windows were built before `run`.
-      st.queue.borrow_mut().push_front(RunEvent::Ready);
-      st.flush();
-    });
     let code = app::exec();
     if let Some(st) = state::<T>() {
       st.emit(RunEvent::Exit);
@@ -1604,4 +1618,52 @@ fn _assert_traits() {
   send_sync::<QtHandle<()>>();
   send_sync::<QtEventProxy<()>>();
   let _ = display_handle_raw;
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn qt_init_attrs_builder() {
+    let qt = Qt::default()
+      .chromium_flags("--a --b")
+      .chromium_flags("--c")
+      .remote_debugging_port(9222);
+    assert_eq!(qt.chromium_flags, vec!["--a --b", "--c"]);
+    assert_eq!(qt.remote_debugging_port, Some(9222));
+    assert_eq!(Qt::default(), Qt::default());
+    // Selectable as the type-erased runtime's init attributes.
+    let _: tauri_runtime::dynamic::DynRuntimeInitAttrs<()> = qt.into();
+  }
+
+  #[test]
+  fn auto_resize_rates() {
+    let r = rates(10, 20, 100, 50, 200, 100).unwrap();
+    assert_eq!((r.x, r.y, r.width, r.height), (0.05, 0.2, 0.5, 0.5));
+    assert!(rates(0, 0, 10, 10, 0, 100).is_none());
+    assert!(rates(0, 0, 10, 10, 100, -1).is_none());
+  }
+
+  #[test]
+  fn theme_to_color_scheme() {
+    assert_eq!(color_scheme(Theme::Dark), app::ColorScheme::Dark);
+    assert_eq!(color_scheme(Theme::Light), app::ColorScheme::Light);
+  }
+
+  #[test]
+  fn display_handles_survive_the_send_round_trip() {
+    use raw_window_handle::RawDisplayHandle as R;
+    assert!(display_from_send(SendHandle(None)).is_none());
+    assert!(matches!(
+      display_from_send(SendHandle(Some((1, 0x1000)))),
+      Some(R::Wayland(h)) if h.display.as_ptr() as usize == 0x1000
+    ));
+    // A null Wayland display is no handle.
+    assert!(display_from_send(SendHandle(Some((1, 0)))).is_none());
+    assert!(matches!(
+      display_from_send(SendHandle(Some((2, 0x2000)))),
+      Some(R::Xlib(h)) if h.display.map(|d| d.as_ptr() as usize) == Some(0x2000)
+    ));
+  }
 }

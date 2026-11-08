@@ -81,5 +81,6 @@ aside { position: sticky; top: 16px; align-self: start; background: var(--card);
 #results li { font: 12px ui-monospace, monospace; margin: 3px 0; overflow-wrap: anywhere; }
 .pass { color: var(--pass); }
 .fail { color: var(--fail); }
+.skip { color: var(--muted, gray); }
 
 #mini { padding: 20px; }

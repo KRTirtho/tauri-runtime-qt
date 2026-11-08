@@ -140,7 +140,8 @@ impl WindowBuilder for QtWindowBuilder {
     match &config.prevent_overflow {
       Some(PreventOverflowConfig::Enable(true)) => w = w.prevent_overflow(),
       Some(PreventOverflowConfig::Margin(m)) => {
-        w = w.prevent_overflow_with_margin(Size::Logical((m.width as f64, m.height as f64).into()))
+        // Physical pixels, as documented by `PreventOverflowMargin` (and as tauri-runtime-wry does).
+        w = w.prevent_overflow_with_margin(Size::Physical((m.width, m.height).into()))
       }
       _ => {}
     }
@@ -294,5 +295,207 @@ impl WindowBuilder for QtWindowBuilder {
   }
   fn no_redirection_bitmap(self, _enable: bool) -> Self {
     self
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use tauri_runtime::dpi::{LogicalSize, PhysicalSize};
+
+  #[test]
+  fn defaults_match_tauri() {
+    let b = QtWindowBuilder::new();
+    assert_eq!(b.title, "Tauri App");
+    assert!(b.resizable && b.maximizable && b.minimizable && b.closable);
+    assert!(b.visible && b.decorations && b.focused && b.focusable && b.shadow);
+    assert!(!b.fullscreen && !b.maximized && !b.transparent && !b.center);
+    assert!(!b.always_on_top && !b.always_on_bottom && !b.skip_taskbar);
+    assert!(b.inner_size.is_none() && b.position.is_none() && b.icon.is_none());
+    assert!(matches!(b.prevent_overflow, PreventOverflow::Off));
+    assert!(!b.has_icon());
+    assert_eq!(b.get_theme(), None);
+  }
+
+  #[test]
+  fn setters_fill_the_attribute_bag() {
+    let b = QtWindowBuilder::new()
+      .title("hello")
+      .center()
+      .position(10.0, 20.0)
+      .inner_size(300.0, 200.0)
+      .min_inner_size(100.0, 50.0)
+      .max_inner_size(900.0, 700.0)
+      .resizable(false)
+      .maximizable(false)
+      .minimizable(false)
+      .closable(false)
+      .fullscreen(true)
+      .focused(false)
+      .focusable(false)
+      .maximized(true)
+      .visible(false)
+      .transparent(true)
+      .decorations(false)
+      .always_on_bottom(true)
+      .always_on_top(true)
+      .visible_on_all_workspaces(true)
+      .content_protected(true)
+      .skip_taskbar(true)
+      .background_color(Color(1, 2, 3, 4))
+      .shadow(false)
+      .theme(Some(Theme::Dark))
+      .window_classname("ignored")
+      .no_redirection_bitmap(true)
+      .icon(Icon {
+        rgba: vec![255; 16].into(),
+        width: 2,
+        height: 2,
+      })
+      .unwrap();
+    assert_eq!(b.title, "hello");
+    assert!(b.center);
+    assert_eq!(b.position, Some((10.0, 20.0)));
+    assert_eq!(b.inner_size, Some((300.0, 200.0)));
+    assert_eq!(
+      b.constraints.min_width,
+      Some(PixelUnit::Logical(100.0.into()))
+    );
+    assert_eq!(
+      b.constraints.min_height,
+      Some(PixelUnit::Logical(50.0.into()))
+    );
+    assert_eq!(
+      b.constraints.max_width,
+      Some(PixelUnit::Logical(900.0.into()))
+    );
+    assert_eq!(
+      b.constraints.max_height,
+      Some(PixelUnit::Logical(700.0.into()))
+    );
+    assert!(!b.resizable && !b.maximizable && !b.minimizable && !b.closable);
+    assert!(b.fullscreen && !b.focused && !b.focusable && b.maximized && !b.visible);
+    assert!(b.transparent && !b.decorations && b.always_on_bottom && b.always_on_top);
+    assert!(b.visible_on_all_workspaces && b.content_protected && b.skip_taskbar);
+    assert_eq!(b.background_color, Some(Color(1, 2, 3, 4)));
+    assert!(!b.shadow);
+    assert_eq!(b.get_theme(), Some(Theme::Dark));
+    assert!(b.has_icon());
+    let icon = b.icon.as_ref().unwrap();
+    assert_eq!((icon.width, icon.height, icon.rgba.len()), (2, 2, 16));
+  }
+
+  #[test]
+  fn prevent_overflow_variants() {
+    let b = QtWindowBuilder::new().prevent_overflow();
+    assert!(matches!(b.prevent_overflow, PreventOverflow::On));
+    let b = QtWindowBuilder::new().prevent_overflow_with_margin(LogicalSize::new(5.0, 6.0).into());
+    assert!(
+      matches!(b.prevent_overflow, PreventOverflow::Margin(Size::Logical(s)) if s == LogicalSize::new(5.0, 6.0))
+    );
+  }
+
+  #[test]
+  fn transient_parents() {
+    // A GTK parent is ignored; a null Qt parent clears it.
+    let b = QtWindowBuilder::new().transient_for(0x1000 as *mut _);
+    assert_eq!(b.transient_parent, None);
+    let b = QtWindowBuilder::new().transient_for_qt(0x1000 as *mut _);
+    assert_eq!(b.transient_parent, Some(0x1000));
+    let b = b.transient_for_qt(std::ptr::null_mut());
+    assert_eq!(b.transient_parent, None);
+  }
+
+  fn config() -> WindowConfig {
+    serde_json::from_value(serde_json::json!({
+      "title": "from config",
+      "width": 640.0,
+      "height": 480.0,
+      "minWidth": 200.0,
+      "minHeight": 100.0,
+      "maxWidth": 1000.0,
+      "x": 5.0,
+      "y": 6.0,
+      "center": true,
+      "resizable": false,
+      "maximizable": false,
+      "minimizable": false,
+      "closable": false,
+      "fullscreen": true,
+      "focus": false,
+      "focusable": false,
+      "maximized": true,
+      "visible": false,
+      "transparent": true,
+      "decorations": false,
+      "alwaysOnBottom": true,
+      "alwaysOnTop": true,
+      "visibleOnAllWorkspaces": true,
+      "contentProtected": true,
+      "skipTaskbar": true,
+      "theme": "Dark",
+      "shadow": false,
+      "backgroundColor": "#11223344",
+      "preventOverflow": true
+    }))
+    .unwrap()
+  }
+
+  #[test]
+  fn with_config_reads_every_field() {
+    let b = QtWindowBuilder::with_config(&config());
+    assert_eq!(b.title, "from config");
+    assert_eq!(b.inner_size, Some((640.0, 480.0)));
+    assert_eq!(
+      b.constraints.min_width,
+      Some(PixelUnit::Logical(200.0.into()))
+    );
+    assert_eq!(
+      b.constraints.min_height,
+      Some(PixelUnit::Logical(100.0.into()))
+    );
+    assert_eq!(
+      b.constraints.max_width,
+      Some(PixelUnit::Logical(1000.0.into()))
+    );
+    assert_eq!(b.constraints.max_height, None);
+    assert_eq!(b.position, Some((5.0, 6.0)));
+    assert!(b.center);
+    assert!(!b.resizable && !b.maximizable && !b.minimizable && !b.closable);
+    assert!(b.fullscreen && !b.focused && !b.focusable && b.maximized && !b.visible);
+    assert!(b.transparent && !b.decorations && b.always_on_bottom && b.always_on_top);
+    assert!(b.visible_on_all_workspaces && b.content_protected && b.skip_taskbar);
+    assert_eq!(b.theme, Some(Theme::Dark));
+    assert!(!b.shadow);
+    assert_eq!(b.background_color, Some(Color(0x11, 0x22, 0x33, 0x44)));
+    assert!(matches!(b.prevent_overflow, PreventOverflow::On));
+  }
+
+  #[test]
+  fn with_config_defaults() {
+    let b = QtWindowBuilder::with_config(&WindowConfig::default());
+    assert_eq!(b.inner_size, Some((800.0, 600.0)));
+    assert!(b.position.is_none() && !b.center);
+    assert!(matches!(b.prevent_overflow, PreventOverflow::Off));
+    assert!(b.background_color.is_none());
+  }
+
+  #[test]
+  fn with_config_prevent_overflow_margin_is_physical() {
+    let c = WindowConfig {
+      prevent_overflow: Some(PreventOverflowConfig::Margin(
+        tauri_utils::config::PreventOverflowMargin {
+          width: 10,
+          height: 20,
+        },
+      )),
+      ..Default::default()
+    };
+    let b = QtWindowBuilder::with_config(&c);
+    assert!(
+      matches!(b.prevent_overflow, PreventOverflow::Margin(Size::Physical(s)) if s == PhysicalSize::new(10, 20)),
+      "{:?}",
+      b.prevent_overflow
+    );
   }
 }

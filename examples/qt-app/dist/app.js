@@ -57,7 +57,17 @@ if (query.includes('child') || query.includes('popup') || isChildWebview) {
   $('mini-close').onclick = () => (isChildWebview ? webview.close() : win.close());
   $('mini-devtools').onclick = () => invoke('devtools', { action: 'toggle' });
   // Used by the self-test.
-  if (query.includes('child')) invoke('whoami').then(label => emit('child-ready', label));
+  if (query.includes('child')) {
+    // `probe` events targeted at this webview are answered with what the page sees (the
+    // self-test checks event targeting, zoom and IPC after reparenting with it).
+    webview.listen('probe', async e => emit('probe-reply', {
+      label: await invoke('whoami'),
+      payload: e.payload,
+      dpr: window.devicePixelRatio,
+      width: window.innerWidth,
+      height: window.innerHeight,
+    })).then(() => invoke('whoami')).then(label => emit('child-ready', label));
+  }
   if (query.includes('popup') && window.opener)
     invoke('whoami').then(label => window.opener.postMessage({ popup: label }, '*'));
 } else {
@@ -292,7 +302,19 @@ async function setup() {
   // QT_APP_AUTO=crash: kill the renderer once; after on_web_content_process_terminate reloads
   // the page, finish.
   if (mode === 'crash') {
-    if (sessionStorage.getItem('crashed')) return invoke('done', { failures: 0 });
+    if (sessionStorage.getItem('crashed')) {
+      let failures = 0;
+      const report = async (name, ok, detail) => {
+        if (!ok) failures++;
+        await invoke('report', { name: `crash: ${name}`, ok, detail: String(detail) });
+      };
+      const n = await invoke('terminations');
+      await report('on_web_content_process_terminate fired once', n === 1, `${n} termination(s)`);
+      await report('the hook reloaded the page in the same webview', webview.label === 'main' && location.protocol === 'tauri:', location.href);
+      const greeting = await invoke('greet', { name: 'after crash' }).catch(e => 'error: ' + e);
+      await report('IPC works in the new renderer', greeting.includes('Hello, after crash'), greeting);
+      return invoke('done', { failures });
+    }
     sessionStorage.setItem('crashed', '1');
     return invoke('navigate', { url: 'chrome://kill' });
   }
@@ -305,22 +327,38 @@ async function setup() {
 // expected result (a development aid; results go to stdout through the `report` command).
 async function smokeTest() {
   const sleep = ms => new Promise(r => setTimeout(r, ms));
-  const logText = () => $('log').innerText;
-  async function step(name, run, expect, timeout = 6000) {
+  const platform = await invoke('qpa_platform');
+  // Show resize/move events in the log: some steps wait for them.
+  $('quiet').checked = false;
+  // `expect` is a regex for the new log lines, or a predicate on them. `skip(lines)` returns a
+  // reason when the step can't work on this platform (reported as [SKIP]).
+  async function step(name, run, expect, timeout = 6000, skip) {
     const before = $('log').children.length;
-    let ok = false, detail = '';
+    let ok = false, detail = '', skipped = false;
+    if (typeof skip === 'string') {
+      await invoke('report', { name: `showcase: ${name}`, ok: true, detail: skip, skipped: true });
+      return true;
+    }
     try {
       await run();
       for (let t = 0; t < timeout && !ok; t += 100) {
         await sleep(100);
         const fresh = [...$('log').children].slice(0, $('log').children.length - before).map(li => li.innerText).join(' || ');
         detail = fresh;
-        ok = expect.test(fresh);
+        ok = typeof expect === 'function' ? expect(fresh) : expect.test(fresh);
       }
+      const reason = !ok && skip && skip(detail);
+      if (reason) { skipped = true; detail = `skipped on ${platform}: ${reason}`; }
     } catch (e) { detail = String(e); }
-    await invoke('report', { name: `showcase: ${name}`, ok, detail: detail.slice(0, 300) });
-    return ok;
+    await invoke('report', { name: `showcase: ${name}`, ok, detail: detail.slice(0, 300), skipped });
+    return ok || skipped;
   }
+  // For actions that log nothing on success: no error within the first poll.
+  const noError = lines => !/Error|error/.test(lines);
+  const closeWindows = prefix => async () => {
+    for (const w of await getAllWindows()) if (w.label.startsWith(prefix)) await w.close();
+  };
+  const onWayland = platform === 'wayland' ? 'Wayland clients cannot position windows' : undefined;
   const click = id => () => $(id).click();
   const change = (id, value) => () => { const el = $(id); if (el.type === 'checkbox') el.checked = value; else el.value = value; el.dispatchEvent(new Event('change')); };
   let failures = 0;
@@ -359,9 +397,34 @@ async function smokeTest() {
     ['menu: View/Actual Size', () => invoke('menu_trigger', { path: 'View/Actual Size' }), /clicked "zoom-reset"/],
     ['media: WebRTC', click('webrtc'), /hello over a WebRTC/],
     ['media: codecs', click('codecs'), /avc1=probably/],
-    ['media: WebGL', click('webgl'), /ANGLE|WebGL2/],
+    ['media: WebGL', click('webgl'), /media(ANGLE|WebGL2 available)/, 3000,
+      lines => platform === 'offscreen' && /no WebGL2/.test(lines) && 'no GPU context offscreen'],
+    ['window: size 800x600', () => document.querySelector('[data-size="800x600"]').click(), /main: Resized\(PhysicalSize \{ width: \d+, height: \d+ \}\)/],
+    ['window: size 1100x820', () => document.querySelector('[data-size="1100x820"]').click(), /main: Resized/],
+    ['window: fullscreen on', click('fullscreen'), /main: Resized/],
+    ['window: fullscreen off', async () => { await sleep(300); $('fullscreen').click(); }, /main: Resized/],
+    ['window: toggle maximize', () => document.querySelector('[data-win="toggleMaximize"]').click(), /main: Resized/],
+    ['window: toggle maximize back', async () => { await sleep(300); document.querySelector('[data-win="toggleMaximize"]').click(); }, /main: Resized/],
+    ['window: position', click('position'), /main: Moved/, 3000, onWayland],
+    ['window: center', () => document.querySelector('[data-win="center"]').click(), noError, 300],
+    ['window: min size', click('min-size'), noError, 300],
+    ['window: decorations off', change('decorations', false), noError, 300],
+    ['window: decorations on', change('decorations', true), noError, 300],
+    ['window: resizable off', change('resizable', false), noError, 300],
+    ['window: resizable on', change('resizable', true), noError, 300],
+    ['window: always on top off', change('on-top', false), noError, 300],
+    ['window: cursor icon', change('cursor-icon', 'pointer'), noError, 300],
+    ['window: request attention', click('attention'), noError, 300],
+    ['window: progress bar', change('progress', 50), noError, 300],
+    ['window: badge', change('badge', 3), noError, 300],
+    ['webview: background color', change('bg', '#336699'), /background #336699/],
+    ['history: forward', async () => { $('push').click(); await sleep(300); document.querySelector('[data-history=back]').click(); await sleep(300); document.querySelector('[data-history=forward]').click(); }, /forward: tauri:.*#step/],
+    ['windows: window.open() popup', click('window-open'), /new-window.*-> popup-\d/],
+    ['windows: close the popup', async () => { await sleep(800); await closeWindows('popup-')(); }, /popup-\d: Destroyed/],
+    ['windows: new window', click('new-window'), /opened window-\d/],
+    ['windows: close it', async () => { await sleep(800); await closeWindows('window-')(); }, /window-\d: Destroyed/],
   ];
-  for (const [name, run, expect, timeout] of steps) if (!(await step(name, run, expect, timeout))) failures++;
+  for (const [name, run, expect, timeout, skip] of steps) if (!(await step(name, run, expect, timeout, skip))) failures++;
   // Close the DevTools window the View menu opened.
   await invoke('devtools', { action: 'close' });
   await invoke('done', { failures });

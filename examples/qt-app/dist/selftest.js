@@ -7,19 +7,39 @@ window.runSelfTest = async function (list) {
   const { WebviewWindow, getAllWebviewWindows } = window.__TAURI__.webviewWindow;
   let failures = 0;
   const assert = (c, m) => { if (!c) throw new Error(m); };
-  async function check(name, fn) {
-    let ok = true, detail;
+  // Thrown by checks that can't run on this platform (reported as [SKIP], not a failure).
+  class Skip extends Error {}
+  const skip = reason => { throw new Skip(reason); };
+  // `offscreen`, `wayland` or `xcb`: offscreen has no GPU (WebGL) and fakes window management;
+  // Wayland doesn't let clients position windows.
+  const platform = await invoke('qpa_platform');
+  // QT_APP_ONLY=<regex> runs only the matching checks (a development aid).
+  const only = await invoke('selftest_only').then(o => o && new RegExp(o));
+  // Checks for known bugs only run with QT_APP_BUGS=1 (some hang the app); otherwise they
+  // are reported as [KNOWN-BUG] with the reason.
+  const runBugs = await invoke('known_bugs');
+  async function knownBug(name, reason, fn, timeout) {
+    if (only && !only.test(name)) return;
+    if (runBugs) return check(`${name} (known bug: ${reason})`, fn, timeout);
+    await invoke('report', { name, ok: false, detail: reason, bug: true }).catch(() => {});
+  }
+  async function check(name, fn, timeout = 8000) {
+    if (only && !only.test(name)) return;
+    let ok = true, skipped = false, detail;
     try {
       detail = String(await Promise.race([
         fn(),
-        new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 8000)),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), timeout)),
       ]));
-    } catch (e) { ok = false; failures++; detail = String(e && e.stack || e); }
+    } catch (e) {
+      if (e instanceof Skip) { skipped = true; detail = `skipped on ${platform}: ${e.message}`; }
+      else { ok = false; failures++; detail = String(e && e.stack || e); }
+    }
     const li = document.createElement('li');
-    li.className = ok ? 'pass' : 'fail';
-    li.textContent = `${ok ? '✓' : '✗'} ${name}: ${detail}`;
+    li.className = skipped ? 'skip' : ok ? 'pass' : 'fail';
+    li.textContent = `${skipped ? '–' : ok ? '✓' : '✗'} ${name}: ${detail}`;
     list.appendChild(li);
-    await invoke('report', { name, ok, detail }).catch(() => {});
+    await invoke('report', { name, ok, detail, skipped }).catch(() => {});
   }
 
   await check('page origin', () => location.href);
@@ -193,9 +213,11 @@ window.runSelfTest = async function (list) {
   });
   await check('WebGL2', () => {
     const gl = document.createElement('canvas').getContext('webgl2');
+    if (!gl && platform === 'offscreen') skip('no GPU context offscreen');
     assert(gl, 'no webgl2');
     const ext = gl.getExtension('WEBGL_debug_renderer_info');
     return ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : 'available';
   });
+  await window.tauriApiChecks({ check, knownBug, assert, skip, sleep, platform });
   await invoke('done', { failures });
 };

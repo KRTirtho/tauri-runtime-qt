@@ -24,8 +24,8 @@ use url::Url;
 
 use crate::{
   Context, MainState, QtRuntime, QtWebview, QtWindowBuilder, SendWrapper, WebviewEntry,
-  WebviewKind, WindowEntry, close_requested, color_scheme, create_webview, create_window,
-  current_theme, destroy_window, rates, util,
+  WebviewKind, WindowEntry, close_requested, create_webview, create_window, current_theme,
+  destroy_window, rates, util,
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -482,9 +482,7 @@ impl<T: UserEvent> WindowDispatch<T> for QtWindowDispatcher<T> {
   }
   /// App-wide, like on every Linux runtime.
   fn set_theme(&self, theme: Option<Theme>) -> Result<()> {
-    self
-      .context
-      .post(move |_| app::set_color_scheme(theme.map(color_scheme)))
+    self.context.post(move |_| crate::apply_theme(theme))
   }
 }
 
