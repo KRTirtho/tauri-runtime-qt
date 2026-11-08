@@ -5,9 +5,10 @@ edition = "2024"
 publish = false
 
 [build-dependencies]
-tauri-build = { version = "2", features = [] }
+tauri-build = { version = "3.0.0-alpha.4", features = [] }
 
 [dependencies]
-tauri = { version = "2.12", default-features = false, features = ["compression"] }
-tauri-runtime-qt = { path = "../../crates/tauri-runtime-qt" }
+tauri = { version = "3.0.0-alpha.6", features = ["devtools", "tray-icon", "unstable", "image-png"] }
+tauri-runtime-qt = { path = "../../crates/tauri-runtime-qt", features = ["devtools"] }
 env_logger = "0.11"
+serde_json = "1"

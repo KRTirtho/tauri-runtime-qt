@@ -1,6 +1,6 @@
 //! Conversions between Tauri runtime types and Qt values.
 
-use qt_webview::Screen;
+use qtshim::app::{self, Screen};
 use tauri_runtime::{
   Error, ResizeDirection,
   dpi::{
@@ -74,7 +74,7 @@ pub fn monitor_from_screen(s: &Screen) -> Monitor {
 
 /// Screen containing a physical point.
 pub fn screen_at_physical(x: f64, y: f64) -> Option<Screen> {
-  qt_webview::screens().into_iter().find(|s| {
+  app::screens().into_iter().find(|s| {
     let (sx, sy) = (s.x as f64 * s.scale, s.y as f64 * s.scale);
     let (sw, sh) = (s.width as f64 * s.scale, s.height as f64 * s.scale);
     x >= sx && x < sx + sw && y >= sy && y < sy + sh
@@ -85,23 +85,23 @@ pub fn screen_at_physical(x: f64, y: f64) -> Option<Screen> {
 pub fn cursor_shape(icon: CursorIcon) -> i32 {
   use CursorIcon::*;
   match icon {
-    Default | Arrow => 0,          // ArrowCursor
-    Crosshair => 2,                // CrossCursor
-    Wait => 3,                     // WaitCursor
-    Text | VerticalText => 4,      // IBeamCursor
+    Default | Arrow => 0,                          // ArrowCursor
+    Crosshair => 2,                                // CrossCursor
+    Wait => 3,                                     // WaitCursor
+    Text | VerticalText => 4,                      // IBeamCursor
     NsResize | NResize | SResize | RowResize => 5, // SizeVerCursor
     EwResize | EResize | WResize | ColResize => 6, // SizeHorCursor
     NeswResize | NeResize | SwResize => 7,         // SizeBDiagCursor
     NwseResize | NwResize | SeResize => 8,         // SizeFDiagCursor
-    Move | AllScroll => 9,         // SizeAllCursor
-    Hand => 13,                    // PointingHandCursor
-    NotAllowed | NoDrop => 14,     // ForbiddenCursor
-    Help | ContextMenu => 15,      // WhatsThisCursor
-    Progress => 16,                // BusyCursor
-    Grab => 17,                    // OpenHandCursor
-    Grabbing => 18,                // ClosedHandCursor
-    Copy => 19,                    // DragCopyCursor
-    Alias => 21,                   // DragLinkCursor
+    Move | AllScroll => 9,                         // SizeAllCursor
+    Hand => 13,                                    // PointingHandCursor
+    NotAllowed | NoDrop => 14,                     // ForbiddenCursor
+    Help | ContextMenu => 15,                      // WhatsThisCursor
+    Progress => 16,                                // BusyCursor
+    Grab => 17,                                    // OpenHandCursor
+    Grabbing => 18,                                // ClosedHandCursor
+    Copy => 19,                                    // DragCopyCursor
+    Alias => 21,                                   // DragLinkCursor
     Cell | ZoomIn | ZoomOut => 2,
     _ => 0,
   }

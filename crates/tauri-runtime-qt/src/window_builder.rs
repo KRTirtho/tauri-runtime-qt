@@ -53,6 +53,8 @@ pub struct QtWindowBuilder {
   pub background_color: Option<Color>,
   pub shadow: bool,
   pub theme: Option<Theme>,
+  /// `QWidget*` of the window to be transient for (see `transient_for_qt`).
+  pub transient_parent: Option<usize>,
 }
 
 impl Default for QtWindowBuilder {
@@ -84,6 +86,7 @@ impl Default for QtWindowBuilder {
       background_color: None,
       shadow: true,
       theme: None,
+      transient_parent: None,
     }
   }
 }
@@ -137,9 +140,7 @@ impl WindowBuilder for QtWindowBuilder {
     match &config.prevent_overflow {
       Some(PreventOverflowConfig::Enable(true)) => w = w.prevent_overflow(),
       Some(PreventOverflowConfig::Margin(m)) => {
-        w = w.prevent_overflow_with_margin(Size::Logical(
-          (m.width as f64, m.height as f64).into(),
-        ))
+        w = w.prevent_overflow_with_margin(Size::Logical((m.width as f64, m.height as f64).into()))
       }
       _ => {}
     }
@@ -265,8 +266,17 @@ impl WindowBuilder for QtWindowBuilder {
     self
   }
   /// Qt windows cannot be made transient for a GTK window; this is ignored.
-  fn transient_for(self, _parent: &impl gtk::glib::IsA<gtk::Window>) -> Self {
-    log::warn!("transient_for(gtk::Window) is not supported by the Qt runtime");
+  ///
+  /// `parent` is an owned `GtkWindow*`, but this runtime never hands out GTK windows, so there
+  /// is no reference to release here.
+  fn transient_for(self, _parent: *mut std::ffi::c_void) -> Self {
+    log::warn!("transient_for(GtkWindow) is not supported by the Qt runtime");
+    self
+  }
+
+  /// Make the window transient for a Qt window (a `QWidget*` from `qt_window`).
+  fn transient_for_qt(mut self, parent: *mut std::ffi::c_void) -> Self {
+    self.transient_parent = (!parent.is_null()).then_some(parent as usize);
     self
   }
   fn theme(mut self, theme: Option<Theme>) -> Self {

@@ -1,6 +1,6 @@
 # tauri-runtime-qt
 
-A [Tauri](https://tauri.app) v2 runtime for Linux that uses **Qt Widgets + QtWebEngine
+A [Tauri](https://tauri.app) v3 runtime for Linux that uses **Qt Widgets + QtWebEngine
 (Chromium)** in place of tao + wry + WebKitGTK.
 
 WebRTC, screen sharing, H.264/VP9/AV1 and WebGL behave like Chrome, because they *are* Chrome.
@@ -9,30 +9,35 @@ Chromium the way Electron or CEF do. Windows are native Wayland (or X11) windows
 nothing has to be embedded across toolkits.
 
 ```
-tauri ──► tauri-runtime (traits) ──► tauri-runtime-qt ──► qt-webview (Rust) ──► cpp/wq.cpp ──► Qt / QtWebEngine
+tauri ──► tauri-runtime (traits) ──► tauri-runtime-qt ──┐
+tauri ──► muda (menus, `qt` feature) ────────────────────┴──► qtshim (safe Rust) ──► qtshim-sys (FFI + C++) ──► Qt / QtWebEngine
 ```
 
 ## Using it
 
+Targets Tauri v3 (`tauri` 3.0.0-alpha.6 / `tauri-runtime` 3.0.0-alpha.5). The Tauri v2 version
+of this runtime lives on the `main` branch.
+
 ```toml
 [dependencies]
-tauri = { version = "2.12", default-features = false, features = ["compression"] }
+tauri = "3.0.0-alpha.6"
 tauri-runtime-qt = { path = "…/crates/tauri-runtime-qt" }
 ```
 
 ```rust
-type R = tauri_runtime_qt::Qt<tauri::EventLoopMessage>;
-
 fn main() {
-  tauri::Builder::<R>::new()
+  tauri::Builder::default()
+    .runtime(tauri_runtime_qt::Qt::default())
     .invoke_handler(tauri::generate_handler![/* … */])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
 }
 ```
 
-Commands that take runtime-generic arguments name the runtime: `tauri::Webview<R>`,
-`tauri::AppHandle<R>`, and so on. See [`examples/qt-app`](examples/qt-app) for a complete app.
+`Qt` carries runtime options: `Qt::default().chromium_flags("--ignore-gpu-blocklist")` and
+`.remote_debugging_port(9222)`. Enable the crate's `devtools` feature (with `tauri/devtools`) for
+DevTools in release builds. See [`examples/qt-app`](examples/qt-app) for a complete app, including
+`window.open()` popups via `on_new_window` + `window_features`.
 
 ### Build requirements
 
@@ -47,19 +52,61 @@ Runtime dependency for packages: `qt6-qtwebengine` (rpm), `libqt6webenginewidget
 ### Running the example
 
 ```sh
-cargo run -p qt-app                       # interactive (camera / screen-share buttons)
-QT_APP_AUTO=1 cargo run -p qt-app         # self-test: commands, events, windows, schemes, WebRTC
+cargo run -p qt-app                       # interactive showcase of (nearly) every Tauri API
+QT_APP_AUTO=1 cargo run -p qt-app         # self-test: IPC, events, windows, popups, history, menus, schemes, WebRTC
+QT_APP_AUTO=smoke cargo run -p qt-app     # clicks through the showcase controls and checks each result
+QT_APP_AUTO=crash cargo run -p qt-app     # kills the renderer once and checks the page recovers
 ```
+
+The showcase is grouped into sections:
+- **About:** engine, Tauri and app info, monitors, cursor position.
+- **Commands & events:** sync, async and failing commands, events both ways, `eval` from Rust.
+- **Window:** title, minimize, maximize, fullscreen, hide/show, always-on-top, decorations,
+  resizable, close prevention, size, position, cursor, theme, progress/badge, drag region.
+- **Webview & DevTools:** open/close/toggle (F12 menu item, Ctrl+Shift+I), zoom, background,
+  history, navigation (plus a link blocked by `on_navigation`), print, clear data, cookies.
+- **Windows & webviews:** new windows (with and without a parent), `window.open` popups,
+  auto-resizing child webviews.
+- **Menus:** the Qt menubar (shortcuts, check items, theme submenu, About), a right-click context
+  menu from the JS `Menu` API, live renaming, and a tray icon.
+- **Media:** camera/microphone and screen sharing (through the runtime's permission prompt),
+  WebRTC, codecs, WebGL, element fullscreen.
+- **Files & protocols:** drag & drop events, downloads, `stream://` with byte ranges, and killing
+  the renderer to exercise `on_web_content_process_terminate`.
+
+A live event log shows every hook firing.
+
+## Menus
+
+Window menus and context menus are real Qt menus. Choosing this runtime turns on `tauri`'s `qt`
+feature, which sends menus to a new Qt backend in [muda](https://github.com/tauri-apps/muda), so
+the normal Tauri APIs work unchanged: `Builder::menu`, `Window::set_menu` / `remove_menu` /
+`hide_menu` / `show_menu`, `on_menu_event`, `Menu::popup`, and the JS `Menu` API.
+
+- Accelerators become Qt shortcuts (active while the window is focused). Clipboard items (Copy,
+  Paste, …) only *display* their shortcut, so they don't take keys from the page.
+- Predefined items work: Copy, Cut, Paste, Select All, Undo, Redo, Minimize, Maximize,
+  Fullscreen, Hide, Close Window (goes through Tauri's close handling), Quit, and About (a Qt
+  dialog). macOS-only items render disabled.
+- Changes (`set_text`, `set_enabled`, `set_checked`, adding/removing items) rebuild the menubar
+  on the next event loop turn.
+- `WebviewWindowBuilder::parent` / `transient_for` no longer fail: the new window is made
+  transient for the parent's Qt window (`QWindow::setTransientParent`).
+
+This needs changes that aren't released yet: muda's `qt` backend (`../muda`, branch
+`qt-backend`, based on muda 0.20.0) and `tauri`'s `qt` feature plus
+`WindowDispatch::qt_window` (`../tauri`, branch `qt-support`, based on Tauri v3). The workspace
+`Cargo.toml` patches both in from those sibling checkouts.
 
 ## How it works
 
 - **One main loop.** Qt on Linux uses the GLib event dispatcher, so `QApplication::exec()` also
-  drives GTK and GLib sources. The runtime calls `gtk::init()`, so GTK-based plugins such as
-  tray icons and dialogs keep working.
+  drives any GTK/GLib sources an app adds. The runtime itself doesn't use GTK. Tauri v3's tray
+  icon defaults to `ksni` (D-Bus), which works without GTK.
 - **IPC.** Tauri's `ipc://` custom protocol works as is. The `window.ipc.postMessage`
   fallback goes over `QWebChannel`.
-- **Custom schemes.** These are registered before the web engine starts: Tauri's defaults are
-  registered up front, and the rest come from the first webview. A browser-side
+- **Custom schemes.** Tauri v3 lists every scheme in `RuntimeInitArgs::custom_schemes`, and they
+  are registered before the web engine starts (QtWebEngine requires that). A browser-side
   `QWebEngineUrlRequestInterceptor` tags each request with its webview, so pages can't spoof it.
   That tag is how scheme requests get routed to the correct Tauri webview label. QtWebEngine
   doesn't pass `Origin` to scheme handlers, so it's rebuilt from the request initiator.
@@ -68,27 +115,28 @@ QT_APP_AUTO=1 cargo run -p qt-app         # self-test: commands, events, windows
   re-reading files.
 - **Permissions.** Requests go to Tauri's permission handler. If there's none, or it answers
   `Default`, the user sees an Allow/Deny prompt, which is remembered per origin for the session.
+- **Popups.** `window.open()` raises Tauri's new-window handler with a `QtWindowOpener`. A
+  window built with `.window_features(features)` and returned as `NewWindowResponse::Create`
+  receives the popup through `QWebEngineNewWindowRequest::openIn`, so `window.opener` works.
+- **History.** `go_back`/`go_forward` run `history.go(±1)` in an isolated world. Chromium's
+  history-manipulation intervention makes browser-initiated Back skip entries an app added with
+  `pushState`, which breaks SPA routers; renderer-initiated navigation behaves like WebKitGTK.
+- **Renderer crashes.** These are reported to `on_web_content_process_terminate`. Without a
+  handler, the page reloads.
 - **Lifecycle.** `CloseRequested`/`Destroyed`/`ExitRequested` semantics mirror
   `tauri-runtime-wry`: closing the last window requests an exit, and either can be prevented.
 
 ## Limitations
 
-- **Menus.** `gtk_window()` and `default_vbox()` return an error, so window menubars and
-  `popup_menu` aren't available. Tray icons work.
 - **Positioning on Wayland.** Wayland doesn't let apps place windows or warp the pointer, so
   `set_position`, `center` and `set_cursor_position` only work on X11.
 - **Status codes.** QtWebEngine scheme handlers can't send arbitrary HTTP status codes. Bodies
   are served with 200/206, redirects work, and empty 4xx/5xx responses become network errors.
   Tauri's IPC doesn't depend on status codes.
-- **Late schemes.** Custom schemes first declared on a later webview, after the engine started,
-  aren't routed. A warning is logged.
 - **App-wide settings.** User agent, proxy and extra Chromium flags apply per profile or app-wide,
   not per webview.
 - **Unsupported (no-ops).** Content protection, visible-on-all-workspaces and shadows.
   `skip_taskbar` maps to `Qt::Tool`.
-- **WebKitGTK still linked.** Binaries still link `libwebkit2gtk-4.1`, because `tauri-runtime`'s
-  Linux trait signatures use `webkit2gtk`/`gtk` types. Dropping that needs `tauri-runtime` to
-  feature-gate them upstream.
 - **Frameless resizing.** Frameless windows resize from a 5 px border, but the cursor doesn't
   change shape on hover.
 
@@ -96,7 +144,7 @@ QT_APP_AUTO=1 cargo run -p qt-app         # self-test: commands, events, windows
 
 | Path | What |
 |---|---|
-| `crates/qt-webview/cpp/wq.{h,cpp}` | C++ shim exposing a flat C API (windows, views, profiles, events, schemes) |
-| `crates/qt-webview/src` | Safe-ish Rust bindings (main-thread types, closures across FFI) |
+| `crates/qtshim-sys` | Raw FFI (`links = "qtshim"`) and the only C++: `cpp/qtshim.h` (the C API), `core.cpp`, `menu.cpp`, `webengine.cpp` (feature `webengine`) |
+| `crates/qtshim` | Safe API over it: `app`, `menu`, `webengine` (feature). Shared by this runtime and muda's Qt backend |
 | `crates/tauri-runtime-qt/src` | `Runtime`, `RuntimeHandle`, `WindowDispatch`, `WebviewDispatch`, `WindowBuilder` |
 | `examples/qt-app` | Tauri app with an in-page self-test |

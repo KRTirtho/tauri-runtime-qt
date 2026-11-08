@@ -4,10 +4,10 @@
 #include <QString>
 #include <functional>
 
-class WqIpcBridge : public QObject {
+class QsIpcBridge : public QObject {
   Q_OBJECT
 public:
-  explicit WqIpcBridge(std::function<void(const QString &)> sink, QObject *parent = nullptr)
+  explicit QsIpcBridge(std::function<void(const QString &)> sink, QObject *parent = nullptr)
       : QObject(parent), m_sink(std::move(sink)) {}
 
   Q_INVOKABLE void postMessage(const QString &message) {
