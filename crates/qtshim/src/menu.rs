@@ -214,7 +214,7 @@ pub trait Container: sealed::Sealed {
     unsafe extern "C" fn tramp(ud: *mut c_void) {
       let _guard = lifecycle::enter_callback();
       let f = unsafe { &*(ud as *const Callback) };
-      f();
+      crate::util::catch_panic("a menu action", f);
     }
     let Some(container) = self.widget().as_ptr() else {
       return;

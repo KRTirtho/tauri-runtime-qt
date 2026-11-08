@@ -118,6 +118,8 @@ void qs_menubar_remove(void *widget) {
     if (QLayout *layout = w->layout(); layout && layout->menuBar() == bar)
       layout->setMenuBar(nullptr);
     bar->hide();
+    // Until the deferred delete runs, don't let qs_menubar_for find (and reuse) this bar.
+    bar->setObjectName(QString());
     bar->deleteLater();
   }
 }
@@ -329,7 +331,7 @@ char *qs_debug_menubar(void *widget) {
   watchPopups();
   QString out;
   auto *w = static_cast<QWidget *>(widget);
-  if (QMenuBar *bar = w->findChild<QMenuBar *>())
+  if (QMenuBar *bar = findMenuBar(w))
     dumpMenu(bar, 0, out);
   return strdup(out.toUtf8().constData());
 }
@@ -348,7 +350,7 @@ char *qs_debug_take_popup(void) {
 
 int qs_debug_trigger(void *widget, const char *path) {
   auto *w = static_cast<QWidget *>(widget);
-  QMenuBar *bar = w->findChild<QMenuBar *>();
+  QMenuBar *bar = findMenuBar(w);
   if (!bar)
     return 0;
   const QStringList parts = QString::fromUtf8(path).split(QLatin1Char('/'));

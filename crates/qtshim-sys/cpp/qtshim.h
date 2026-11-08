@@ -101,9 +101,10 @@ int qs_app_exec(void);
 void qs_app_quit(int code);
 void qs_app_process_events(void);
 void qs_app_shutdown(void);
+// Run `f(ud)` on the main thread from the event loop. Does nothing without a QApplication; calls
+// still queued when it's destroyed never run (the caller owns `ud` and must free it then).
 void qs_dispatch(qs_fn f, void *ud);
-// Like qs_dispatch but for the main thread itself: runs `f(ud)` from the event loop, or right away
-// if there is no QApplication yet.
+// The same, for the main thread itself.
 void qs_post(qs_fn f, void *ud);
 // 0 unknown, 1 light, 2 dark
 int qs_app_color_scheme(void);

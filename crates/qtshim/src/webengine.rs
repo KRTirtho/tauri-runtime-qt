@@ -237,12 +237,9 @@ pub fn set_scheme_handler(f: impl Fn(SchemeRequest, Responder) + 'static) {
     let responder = Responder(Some(job));
     match req.body(body) {
       Ok(request) => {
-        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::util::catch_panic("the scheme handler", || {
           f(SchemeRequest { view, request }, responder)
-        }));
-        if r.is_err() {
-          eprintln!("qt-webview: panic in scheme handler");
-        }
+        });
       }
       Err(_) => drop(responder),
     }
@@ -580,13 +577,17 @@ impl Window {
     crate::lifecycle::ensure();
     unsafe { sys::qs_window_set_transient_for(self.p(), parent.p()) }
   }
+  /// The window's `QWidget*`, valid while this `Window` exists. Hand it to code that takes a
+  /// widget pointer (it can come back in through [`crate::menu::Widget::from_ptr`]).
+  pub fn widget_ptr(&self) -> NonNull<c_void> {
+    crate::lifecycle::ensure();
+    NonNull::new(unsafe { sys::qs_window_qwidget(self.p()) }).expect("window has no QWidget")
+  }
   /// The window's `QWidget`, e.g. for [`crate::menu::MenuBar`].
   pub fn widget(&self) -> crate::menu::Widget {
     crate::lifecycle::ensure();
-    let widget =
-      NonNull::new(unsafe { sys::qs_window_qwidget(self.p()) }).expect("window has no QWidget");
     // SAFETY: the window is alive while `self` exists.
-    unsafe { crate::menu::Widget::track(widget) }
+    unsafe { crate::menu::Widget::track(self.widget_ptr()) }
   }
   /// Logical size of the area holding the views (excludes a menubar).
   pub fn content_size(&self) -> (i32, i32) {
@@ -667,7 +668,8 @@ type StrCb = Box<dyn Fn(&str)>;
 unsafe extern "C" fn call_str(ud: *mut c_void, s: *const c_char, len: usize) {
   let _guard = crate::lifecycle::enter_callback();
   let f = unsafe { &*(ud as *const StrCb) };
-  f(unsafe { str_arg(s, len) });
+  let s = unsafe { str_arg(s, len) };
+  crate::util::catch_panic("a JavaScript result callback", || f(s));
 }
 
 /// A `QWebEngineView` inside a [`Window`]. Destroyed on drop. Not `Send`.

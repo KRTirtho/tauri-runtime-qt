@@ -190,11 +190,15 @@ impl<T: UserEvent> Context<T> {
       return Err(Error::EventLoopClosed);
     }
     let (tx, rx) = sync_channel(1);
-    app::dispatch(move || {
+    let queued = app::dispatch(move || {
       if let Some(st) = state::<T>() {
         let _ = tx.send(f(&st));
       }
     });
+    if !queued {
+      return Err(Error::EventLoopClosed);
+    }
+    // If the app shuts down before running `f`, it's dropped with `tx` and this fails.
     rx.recv().map_err(|_| Error::FailedToReceiveMessage)
   }
 
@@ -221,12 +225,16 @@ impl<T: UserEvent> Context<T> {
     if !self.shared.alive.load(Ordering::Acquire) {
       return Err(Error::EventLoopClosed);
     }
-    app::dispatch(move || {
+    let queued = app::dispatch(move || {
       if let Some(st) = state::<T>() {
         f(&st);
       }
     });
-    Ok(())
+    if queued {
+      Ok(())
+    } else {
+      Err(Error::EventLoopClosed)
+    }
   }
 
   pub(crate) fn update_launcher(

@@ -4,6 +4,16 @@
 
 use std::ffi::{CStr, CString, c_char, c_void};
 
+/// Run `f`, turning a panic into `None` (with a message naming `what`). Every function Qt calls
+/// back into uses this: a panic can't unwind through Qt's C++ frames and would abort.
+pub(crate) fn catch_panic<R>(what: &str, f: impl FnOnce() -> R) -> Option<R> {
+  let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+  if r.is_err() {
+    eprintln!("qtshim: panic in {what}");
+  }
+  r.ok()
+}
+
 pub(crate) unsafe extern "C" fn drop_box<T>(ud: *mut c_void) {
   drop(unsafe { Box::from_raw(ud as *mut T) });
 }

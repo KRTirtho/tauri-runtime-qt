@@ -1369,10 +1369,8 @@ static void shutdownWebEngine() {
   const auto views = g_views.values();
   for (QsView *v : views)
     teardownView(v);
-  QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
-  for (QWidget *w : QApplication::topLevelWidgets())
-    delete w;
-  QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+  // Pages must be gone before their profiles.
+  deleteTopLevelWidgets();
   for (QsProfile *p : std::as_const(g_profiles)) {
     delete p->p;
     delete p;

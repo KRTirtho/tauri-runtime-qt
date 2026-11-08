@@ -5,15 +5,20 @@
 //! sources.
 
 use std::{
-  cell::RefCell,
+  cell::{Cell, RefCell},
+  collections::BTreeMap,
   ffi::{CStr, c_char, c_int, c_void},
   ptr::NonNull,
   rc::Rc,
+  sync::{
+    Mutex, PoisonError,
+    atomic::{AtomicUsize, Ordering},
+  },
 };
 
 use qtshim_sys as sys;
 
-use crate::util::{boxed, cstring, str_arg};
+use crate::util::{catch_panic, cstring, str_arg};
 
 // ---------------------------------------------------------------------------------------------
 // events
@@ -179,12 +184,10 @@ unsafe extern "C" fn event_tramp(
     s1: unsafe { str_arg(ev.s1, ev.s1_len) },
     s2: unsafe { str_arg(ev.s2, ev.s2_len) },
   };
-  let r = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(&event))) {
-    Ok(r) => r,
-    Err(_) => {
-      eprintln!("qtshim: panic in the event handler for {:?}", event.kind);
-      return -1;
-    }
+  let Some(r) = catch_panic(&format!("the event handler for {:?}", event.kind), || {
+    handler(&event)
+  }) else {
+    return -1;
   };
   unsafe {
     sys::qs_reply_set_int(reply, r.int);
@@ -218,13 +221,15 @@ pub fn set_event_handler(f: impl Fn(&Event<'_>) -> Reply + 'static) {
 pub fn init(app_id: Option<&str>) -> String {
   crate::lifecycle::start();
   let id = app_id.map(cstring);
-  unsafe {
+  let description = unsafe {
     CStr::from_ptr(sys::qs_app_init(
       id.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
     ))
   }
   .to_string_lossy()
-  .into_owned()
+  .into_owned();
+  crate::lifecycle::set_alive();
+  description
 }
 
 /// Run the Qt (and GLib) event loop until [`quit`] is called; returns the exit code.
@@ -246,7 +251,9 @@ pub fn process_events() {
 }
 
 /// Tear down whatever is left (windows, views, web profiles) and destroy the `QApplication`.
-/// Call once after [`exec`] returns and after dropping your own windows and views.
+/// Call once after [`exec`] returns and after dropping your own windows and views. Closures
+/// still queued by [`dispatch`] or [`post`] are dropped without running. The application can't
+/// be created again afterwards.
 ///
 /// # Panics
 ///
@@ -257,6 +264,11 @@ pub fn shutdown() {
   // inert: their methods panic and their `Drop` does nothing.
   crate::lifecycle::stop();
   EVENT_HANDLER.with(|h| h.borrow_mut().take());
+  // Qt discards the queued calls; drop their closures (and whatever they captured, such as a
+  // channel another thread waits on) instead of leaking them.
+  let dispatched = std::mem::take(&mut *lock_dispatched());
+  let posted = POSTED.with(|p| std::mem::take(&mut *p.borrow_mut()));
+  drop((dispatched, posted));
   unsafe { sys::qs_app_shutdown() }
 }
 
@@ -266,20 +278,40 @@ pub fn is_running() -> bool {
   crate::lifecycle::is_running_here()
 }
 
+// Queued closures are kept here, not handed to Qt, so `shutdown` can drop the ones Qt never ran.
+// Qt only gets their id.
+
+type SendTask = Box<dyn FnOnce() + Send>;
+type Task = Box<dyn FnOnce()>;
+
+static DISPATCHED: Mutex<BTreeMap<usize, SendTask>> = Mutex::new(BTreeMap::new());
+static NEXT_DISPATCHED: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+  static POSTED: RefCell<BTreeMap<usize, Task>> = const { RefCell::new(BTreeMap::new()) };
+  static NEXT_POSTED: Cell<usize> = const { Cell::new(0) };
+}
+
+fn lock_dispatched() -> std::sync::MutexGuard<'static, BTreeMap<usize, SendTask>> {
+  DISPATCHED.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// Run `f` on the main thread from the event loop. May be called from any thread.
 ///
 /// Returns `false` (and drops `f`) if the application isn't running.
 pub fn dispatch<F: FnOnce() + Send + 'static>(f: F) -> bool {
-  unsafe extern "C" fn tramp(ud: *mut c_void) {
+  unsafe extern "C" fn tramp(id: *mut c_void) {
     let _guard = crate::lifecycle::enter_callback();
-    let f = unsafe { Box::from_raw(ud as *mut Box<dyn FnOnce()>) };
-    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err() {
-      eprintln!("qtshim: panic in a dispatched closure");
+    // Take it out before running it: it may dispatch again.
+    let task = lock_dispatched().remove(&(id as usize));
+    if let Some(task) = task {
+      catch_panic("a dispatched closure", task);
     }
   }
   crate::lifecycle::while_alive(move || {
-    let f: Box<dyn FnOnce()> = Box::new(f);
-    unsafe { sys::qs_dispatch(tramp, boxed(f)) }
+    let id = NEXT_DISPATCHED.fetch_add(1, Ordering::Relaxed);
+    lock_dispatched().insert(id, Box::new(f));
+    unsafe { sys::qs_dispatch(tramp, id as *mut c_void) }
   })
   .is_some()
 }
@@ -288,13 +320,16 @@ pub fn dispatch<F: FnOnce() + Send + 'static>(f: F) -> bool {
 /// but this must be called on the main thread.
 pub fn post<F: FnOnce() + 'static>(f: F) {
   crate::lifecycle::ensure();
-  unsafe extern "C" fn tramp(ud: *mut c_void) {
+  unsafe extern "C" fn tramp(id: *mut c_void) {
     let _guard = crate::lifecycle::enter_callback();
-    let f = unsafe { Box::from_raw(ud as *mut Box<dyn FnOnce()>) };
-    f();
+    let task = POSTED.with(|p| p.borrow_mut().remove(&(id as usize)));
+    if let Some(task) = task {
+      catch_panic("a posted closure", task);
+    }
   }
-  let f: Box<dyn FnOnce()> = Box::new(f);
-  unsafe { sys::qs_post(tramp, boxed(f)) }
+  let id = NEXT_POSTED.with(|n| n.replace(n.get() + 1));
+  POSTED.with(|p| p.borrow_mut().insert(id, Box::new(f)));
+  unsafe { sys::qs_post(tramp, id as *mut c_void) }
 }
 
 // ---------------------------------------------------------------------------------------------
