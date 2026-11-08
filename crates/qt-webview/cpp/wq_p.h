@@ -1,0 +1,22 @@
+// Private Qt classes that need moc.
+#pragma once
+#include <QObject>
+#include <QString>
+#include <functional>
+
+class WqIpcBridge : public QObject {
+  Q_OBJECT
+public:
+  explicit WqIpcBridge(std::function<void(const QString &)> sink, QObject *parent = nullptr)
+      : QObject(parent), m_sink(std::move(sink)) {}
+
+  Q_INVOKABLE void postMessage(const QString &message) {
+    if (m_sink)
+      m_sink(message);
+  }
+
+  void detach() { m_sink = nullptr; }
+
+private:
+  std::function<void(const QString &)> m_sink;
+};

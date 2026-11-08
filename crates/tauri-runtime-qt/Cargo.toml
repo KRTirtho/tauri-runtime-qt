@@ -1,0 +1,20 @@
+[package]
+name = "tauri-runtime-qt"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0 OR MIT"
+description = "A Tauri runtime backed by Qt and QtWebEngine (Chromium) for Linux"
+rust-version = "1.85"
+
+[dependencies]
+qt-webview = { path = "../qt-webview" }
+tauri-runtime = "2.12"
+tauri-utils = "2.10"
+http = "1"
+url = "2"
+cookie = "0.18"
+raw-window-handle = "0.6"
+log = "0.4"
+# Required by tauri-runtime's Linux-only trait signatures (gtk_window, NewWindowOpener).
+gtk = "0.18"
+webkit2gtk = { version = "=2.0", features = ["v2_40"] }

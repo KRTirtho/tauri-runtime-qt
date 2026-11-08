@@ -1,0 +1,154 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Tauri on QtWebEngine</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 14px system-ui, sans-serif; margin: 24px; }
+  h1 { font-size: 20px; }
+  li { margin: 4px 0; font-family: ui-monospace, monospace; }
+  .pass { color: #2a8a3e; } .fail { color: #c62828; }
+  video { width: 320px; border-radius: 6px; background: #000; }
+  button { font: inherit; padding: 6px 12px; }
+</style>
+</head>
+<body>
+<h1 id="h">Tauri on QtWebEngine</h1>
+<p><button id="cam">Start camera + mic</button> <button id="screen">Share screen</button></p>
+<video id="v" autoplay playsinline muted></video>
+<ol id="results"></ol>
+<script>
+const { invoke } = window.__TAURI__.core;
+const { listen, emit } = window.__TAURI__.event;
+
+if (location.search.includes('child')) {
+  document.getElementById('h').textContent = 'Second window';
+  invoke('whoami').then(label => emit('child-ready', label));
+} else {
+  runSelfTest();
+}
+
+document.getElementById('cam').onclick = async () => {
+  const s = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+  document.getElementById('v').srcObject = s;
+};
+document.getElementById('screen').onclick = async () => {
+  const s = await navigator.mediaDevices.getDisplayMedia({ video: true });
+  document.getElementById('v').srcObject = s;
+};
+
+async function runSelfTest() {
+  const { getCurrentWindow } = window.__TAURI__.window;
+  const { WebviewWindow, getAllWebviewWindows } = window.__TAURI__.webviewWindow;
+  const list = document.getElementById('results');
+  let failures = 0;
+  const assert = (c, m) => { if (!c) throw new Error(m); };
+  async function check(name, fn) {
+    let ok = true, detail;
+    try {
+      detail = String(await Promise.race([
+        fn(),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 8000)),
+      ]));
+    } catch (e) { ok = false; failures++; detail = String(e && e.stack || e); }
+    const li = document.createElement('li');
+    li.className = ok ? 'pass' : 'fail';
+    li.textContent = `${ok ? '✓' : '✗'} ${name}: ${detail}`;
+    list.appendChild(li);
+    await invoke('report', { name, ok, detail }).catch(() => {});
+  }
+
+  await check('page origin', () => location.href);
+  await check('engine', () => navigator.userAgent);
+  await check('invoke (sync command)', async () => {
+    const r = await invoke('greet', { name: 'Qt' });
+    assert(r.includes('Hello, Qt'), r);
+    return r;
+  });
+  await check('invoke (async command)', async () => {
+    const r = await invoke('slow_add', { a: 2, b: 40 });
+    assert(r === 42, r);
+    return r;
+  });
+  await check('invoke (error)', async () => {
+    try { await invoke('fail'); } catch (e) {
+      assert(String(e).includes('expected failure'), e);
+      return 'rejected with: ' + e;
+    }
+    throw new Error('command did not fail');
+  });
+  await check('IPC routed to the right webview', async () => {
+    const label = await invoke('whoami');
+    assert(label === 'main', label);
+    return label;
+  });
+  await check('event Rust -> JS', () => new Promise(async (res) => {
+    const un = await listen('from-rust', e => { un(); res('received ' + JSON.stringify(e.payload)); });
+    await invoke('ping_event');
+  }));
+  await check('event JS -> Rust', async () => { await emit('from-js', { hello: 'rust' }); return 'emitted'; });
+  await check('window API', async () => {
+    const w = getCurrentWindow();
+    const size = await w.innerSize();
+    const scale = await w.scaleFactor();
+    await w.setTitle('Tauri on QtWebEngine ✓');
+    const title = await w.title();
+    assert(title.endsWith('✓'), title);
+    return `${size.width}x${size.height} @${scale}x, title="${title}", focused=${await w.isFocused()}`;
+  });
+  await check('custom protocol + byte ranges', async () => {
+    const url = window.__TAURI__.core.convertFileSrc('data', 'stream');
+    const full = await (await fetch(url)).text();
+    const r = await fetch(url, { headers: { Range: 'bytes=10-19' } });
+    const part = await r.text();
+    assert(r.status === 206, 'status ' + r.status);
+    assert(part === full.slice(10, 20), `got "${part}" want "${full.slice(10, 20)}"`);
+    return `${url}: ${full.length} bytes, range -> ${r.status} "${part}" (${r.headers.get('content-range')})`;
+  });
+  await check('second window: create, IPC, close', async () => {
+    const ready = new Promise(async res => {
+      const un = await listen('child-ready', e => { un(); res(e.payload); });
+    });
+    const w = new WebviewWindow('second', { url: 'index.html?child', title: 'Second', width: 420, height: 320 });
+    await new Promise((res, rej) => {
+      w.once('tauri://created', res);
+      w.once('tauri://error', e => rej(new Error(JSON.stringify(e.payload))));
+    });
+    const label = await ready;
+    assert(label === 'second', 'child reported ' + label);
+    await w.close();
+    await new Promise(r => setTimeout(r, 400));
+    const labels = (await getAllWebviewWindows()).map(w => w.label);
+    assert(!labels.includes('second'), 'still open: ' + labels);
+    return `child identified as "${label}", remaining windows: ${labels}`;
+  });
+  await check('WebRTC data channel', async () => {
+    const a = new RTCPeerConnection(), b = new RTCPeerConnection();
+    a.onicecandidate = e => e.candidate && b.addIceCandidate(e.candidate);
+    b.onicecandidate = e => e.candidate && a.addIceCandidate(e.candidate);
+    const dc = a.createDataChannel('t');
+    const got = new Promise(res => b.ondatachannel = e => e.channel.onmessage = m => res(m.data));
+    await a.setLocalDescription(await a.createOffer());
+    await b.setRemoteDescription(a.localDescription);
+    await b.setLocalDescription(await b.createAnswer());
+    await a.setRemoteDescription(b.localDescription);
+    dc.onopen = () => dc.send('hello over WebRTC');
+    return await got;
+  });
+  await check('codecs', () => {
+    const v = document.createElement('video');
+    return ['video/mp4; codecs="avc1.42E01E"', 'video/webm; codecs="vp9"', 'video/mp4; codecs="av01.0.05M.08"']
+      .map(t => `${t.split(';')[0]} ${t.match(/codecs="([^".]+)/)[1]}=${v.canPlayType(t) || 'no'}`).join(', ');
+  });
+  await check('WebGL2', () => {
+    const gl = document.createElement('canvas').getContext('webgl2');
+    assert(gl, 'no webgl2');
+    const ext = gl.getExtension('WEBGL_debug_renderer_info');
+    return ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : 'available';
+  });
+  await invoke('done', { failures });
+}
+</script>
+</body>
+</html>
