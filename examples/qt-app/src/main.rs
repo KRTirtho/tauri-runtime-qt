@@ -26,6 +26,7 @@ use tauri::{
   },
   webview::{DownloadEvent, NewWindowResponse, PageLoadEvent, PermissionResponse},
 };
+use tauri_runtime_qt::debug::Widget;
 
 type R = tauri::DynRuntime;
 
@@ -111,16 +112,20 @@ fn done(app: AppHandle, failures: u32) {
   }
 }
 
-/// Run `f` on the main thread with the window's `QWidget*` and return its result.
+/// Run `f` on the main thread with the window's `QWidget` and return its result.
 fn with_qt_window<T: Send + 'static>(
   window: &tauri::Window,
-  f: impl FnOnce(*mut std::ffi::c_void) -> T + Send + 'static,
+  f: impl FnOnce(&Widget) -> T + Send + 'static,
 ) -> Result<T, String> {
   let (tx, rx) = std::sync::mpsc::channel();
   let window_ = window.clone();
   window
     .run_on_main_thread(move || {
-      let _ = tx.send(window_.qt_window().map(f).map_err(|e| e.to_string()));
+      let widget = window_
+        .qt_window()
+        .map_err(|e| e.to_string())
+        .and_then(|w| Widget::from_ptr(w).ok_or_else(|| "not a live QWidget".to_string()));
+      let _ = tx.send(widget.map(|w| f(&w)));
     })
     .map_err(|e| e.to_string())?;
   rx.recv().map_err(|e| e.to_string())?
@@ -148,7 +153,7 @@ fn find_menu_item(app: &AppHandle, id: &str) -> Option<MenuItemKind<R>> {
   fn search(items: Vec<MenuItemKind<R>>, id: &str) -> Option<MenuItemKind<R>> {
     items.into_iter().find_map(|i| match i {
       MenuItemKind::Submenu(s) => search(s.items().ok()?, id),
-      other if other.id() == &id => Some(other),
+      other if other.id() == id => Some(other),
       _ => None,
     })
   }

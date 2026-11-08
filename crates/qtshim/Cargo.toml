@@ -1,0 +1,22 @@
+[package]
+name = "qtshim"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0 OR MIT"
+description = "A safe Rust API over Qt Widgets and QtWebEngine for Tauri runtimes and menu libraries"
+repository = "https://github.com/KRTirtho/tauri-runtime-qt"
+categories = ["api-bindings", "gui"]
+keywords = ["qt", "qtwebengine", "menu", "webview"]
+
+[features]
+default = []
+# Windows hosting QWebEngineViews, profiles, custom schemes and IPC (needs QtWebEngine).
+webengine = ["qtshim-sys/webengine", "dep:http"]
+
+[dependencies]
+qtshim-sys = { version = "0.1", path = "../qtshim-sys" }
+http = { version = "1", optional = true }
+
+[package.metadata.docs.rs]
+all-features = true

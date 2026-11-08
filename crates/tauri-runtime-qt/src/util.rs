@@ -1,6 +1,6 @@
 //! Conversions between Tauri runtime types and Qt values.
 
-use qt_webview::Screen;
+use qtshim::app::{self, Screen};
 use tauri_runtime::{
   Error, ResizeDirection,
   dpi::{
@@ -74,7 +74,7 @@ pub fn monitor_from_screen(s: &Screen) -> Monitor {
 
 /// Screen containing a physical point.
 pub fn screen_at_physical(x: f64, y: f64) -> Option<Screen> {
-  qt_webview::screens().into_iter().find(|s| {
+  app::screens().into_iter().find(|s| {
     let (sx, sy) = (s.x as f64 * s.scale, s.y as f64 * s.scale);
     let (sw, sh) = (s.width as f64 * s.scale, s.height as f64 * s.scale);
     x >= sx && x < sx + sw && y >= sy && y < sy + sh

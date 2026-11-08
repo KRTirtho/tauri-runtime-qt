@@ -1,6 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["crates/qt-webview", "crates/tauri-runtime-qt", "examples/qt-app"]
+members = [
+  "crates/qtshim-sys",
+  "crates/qtshim",
+  "crates/tauri-runtime-qt",
+  "examples/qt-app",
+]
 
 # Qt menus need `tauri`'s `qt` feature and muda's Qt backend, which aren't released yet:
 # build against local checkouts (../tauri on branch `qt-support`, ../muda on `qt-backend`).

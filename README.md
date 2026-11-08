@@ -9,7 +9,8 @@ Chromium the way Electron or CEF do. Windows are native Wayland (or X11) windows
 nothing has to be embedded across toolkits.
 
 ```
-tauri ──► tauri-runtime (traits) ──► tauri-runtime-qt ──► qt-webview (Rust) ──► cpp/wq.cpp ──► Qt / QtWebEngine
+tauri ──► tauri-runtime (traits) ──► tauri-runtime-qt ──┐
+tauri ──► muda (menus, `qt` feature) ────────────────────┴──► qtshim (safe Rust) ──► qtshim-sys (FFI + C++) ──► Qt / QtWebEngine
 ```
 
 ## Using it
@@ -143,7 +144,7 @@ This needs changes that aren't released yet: muda's `qt` backend (`../muda`, bra
 
 | Path | What |
 |---|---|
-| `crates/qt-webview/cpp/wq.{h,cpp}` | C++ shim exposing a flat C API (windows, views, profiles, events, schemes) |
-| `crates/qt-webview/src` | Safe-ish Rust bindings (main-thread types, closures across FFI) |
+| `crates/qtshim-sys` | Raw FFI (`links = "qtshim"`) and the only C++: `cpp/qtshim.h` (the C API), `core.cpp`, `menu.cpp`, `webengine.cpp` (feature `webengine`) |
+| `crates/qtshim` | Safe API over it: `app`, `menu`, `webengine` (feature). Shared by this runtime and muda's Qt backend |
 | `crates/tauri-runtime-qt/src` | `Runtime`, `RuntimeHandle`, `WindowDispatch`, `WebviewDispatch`, `WindowBuilder` |
 | `examples/qt-app` | Tauri app with an in-page self-test |

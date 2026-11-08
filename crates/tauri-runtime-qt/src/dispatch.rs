@@ -6,7 +6,10 @@ use std::{
   sync::{Arc, Mutex},
 };
 
-use qt_webview::{WindowFlag, window_state as ws};
+use qtshim::{
+  app,
+  webengine::{WindowFlag, window_state as ws},
+};
 use raw_window_handle::{RawWindowHandle, WindowHandle};
 use tauri_runtime::{
   Cookie, Error, Icon, ProgressBarState, ProgressBarStatus, ResizeDirection, Result,
@@ -206,8 +209,9 @@ impl<T: UserEvent> WindowDispatch<T> for QtWindowDispatcher<T> {
   /// The window's `QWidget*`; `tauri` installs muda's Qt menubar on it.
   fn qt_window(&self) -> Result<*mut std::ffi::c_void> {
     self
-      .with(|w| w.window.qwidget() as usize)
+      .with(|w| w.window.widget().as_ptr().map(|p| p.as_ptr() as usize))?
       .map(|p| p as *mut std::ffi::c_void)
+      .ok_or(Error::WindowNotFound)
   }
 
   fn window_handle(&self) -> std::result::Result<WindowHandle<'_>, raw_window_handle::HandleError> {
@@ -215,8 +219,8 @@ impl<T: UserEvent> WindowDispatch<T> for QtWindowDispatcher<T> {
     let handle = self
       .with(|w| {
         w.window.native_handle().map(|h| match h {
-          qt_webview::NativeHandle::Wayland(p) => (1u8, p.as_ptr() as usize),
-          qt_webview::NativeHandle::X11(id) => (2u8, id),
+          app::NativeHandle::Wayland(p) => (1u8, p.as_ptr() as usize),
+          app::NativeHandle::X11(id) => (2u8, id),
         })
       })
       .map_err(|_| HandleError::Unavailable)?
@@ -481,7 +485,7 @@ impl<T: UserEvent> WindowDispatch<T> for QtWindowDispatcher<T> {
   fn set_theme(&self, theme: Option<Theme>) -> Result<()> {
     self
       .context
-      .post(move |_| qt_webview::set_color_scheme(theme.map(color_scheme)))
+      .post(move |_| app::set_color_scheme(theme.map(color_scheme)))
   }
 }
 

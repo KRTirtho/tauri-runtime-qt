@@ -18,7 +18,6 @@
 
 use std::{
   any::Any,
-  borrow::Cow,
   cell::{Cell, RefCell},
   collections::{BTreeMap, HashMap, VecDeque},
   fmt,
@@ -32,7 +31,10 @@ use std::{
   thread::ThreadId,
 };
 
-use qt_webview::{Event, EventKind, Profile, Reply, SchemeFlags, View, ViewOptions};
+use qtshim::{
+  app::{self, Event, EventKind, Reply},
+  webengine::{self, Profile, SchemeFlags, View, ViewOptions},
+};
 use raw_window_handle::{DisplayHandle, RawDisplayHandle};
 use tauri_runtime::{
   DeviceEventFilter, Error, EventLoopProxy, ExitRequestedEventAction, Result, RunEvent, Runtime,
@@ -40,8 +42,10 @@ use tauri_runtime::{
   dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize},
   monitor::Monitor,
   webview::{
-    DetachedWebview, DownloadEvent, NewWindowFeatures, NewWindowResponse, PageLoadEvent,
-    PendingWebview, PermissionKind, PermissionResponse, WebContentProcessTermination,
+    DetachedWebview, DocumentTitleChangedHandler, DownloadEvent, DownloadHandler,
+    NavigationHandler, NewWindowFeatures, NewWindowHandler, NewWindowResponse, OnPageLoadHandler,
+    OnWebContentProcessTerminateHandler, PageLoadEvent, PendingWebview, PermissionKind,
+    PermissionResponse, UriSchemeProtocolHandler, WebContentProcessTermination,
     WebContentProcessTerminationReason, WebviewIpcHandler,
   },
   window::{
@@ -58,10 +62,15 @@ mod window_builder;
 
 pub use dispatch::{QtWebviewDispatcher, QtWindowDispatcher};
 
-/// Debugging helpers for the Qt menubar of a window (use `tauri::Window::qt_window` for the
-/// `QWidget*`). Main thread only.
+/// Debugging helpers for the Qt menubar of a window. Main thread only.
+///
+/// Turn the pointer from `tauri::Window::qt_window` into a [`Widget`](debug::Widget) with
+/// [`Widget::from_ptr`](debug::Widget::from_ptr).
 pub mod debug {
-  pub use qt_webview::debug::{menubar_tree, take_popup_menu, trigger_menu_item};
+  pub use qtshim::menu::{
+    Widget,
+    debug::{menubar_tree, take_popup_menu, trigger_menu_item},
+  };
 }
 pub use window_builder::QtWindowBuilder;
 
@@ -123,10 +132,8 @@ pub struct QtWindowOpener {
 /// scheme before the engine starts).
 const DEFAULT_SCHEMES: &[&str] = &["tauri", "ipc", "asset", "isolation"];
 
-type ProtocolHandler = dyn Fn(&str, http::Request<Vec<u8>>, Box<dyn FnOnce(http::Response<Cow<'static, [u8]>>) + Send>)
-  + Send
-  + Sync
-  + 'static;
+/// Runs the app's event callback.
+type RunCallback<T> = Box<dyn FnMut(RunEvent<T>)>;
 
 // ---------------------------------------------------------------------------------------------
 // shared (thread-safe) context
@@ -183,7 +190,7 @@ impl<T: UserEvent> Context<T> {
       return Err(Error::EventLoopClosed);
     }
     let (tx, rx) = sync_channel(1);
-    qt_webview::dispatch(move || {
+    app::dispatch(move || {
       if let Some(st) = state::<T>() {
         let _ = tx.send(f(&st));
       }
@@ -214,7 +221,7 @@ impl<T: UserEvent> Context<T> {
     if !self.shared.alive.load(Ordering::Acquire) {
       return Err(Error::EventLoopClosed);
     }
-    qt_webview::dispatch(move || {
+    app::dispatch(move || {
       if let Some(st) = state::<T>() {
         f(&st);
       }
@@ -242,7 +249,7 @@ impl<T: UserEvent> Context<T> {
     let desktop = l.2.clone().or_else(|| self.shared.app_id.clone());
     drop(l);
     let _ = self.post(move |_| {
-      qt_webview::launcher_update(desktop.as_deref(), count, progress);
+      app::launcher_update(desktop.as_deref(), count, progress);
     });
   }
 }
@@ -279,7 +286,7 @@ pub(crate) struct WindowEntry {
   pub label: String,
   /// Declared before `window` so views are destroyed before their window.
   pub webviews: Vec<WebviewEntry>,
-  pub window: qt_webview::Window,
+  pub window: webengine::Window,
 }
 
 impl WindowEntry {
@@ -293,14 +300,13 @@ pub(crate) struct WebviewMeta<T: UserEvent> {
   label: String,
   window_id: Arc<Mutex<WindowId>>,
   ipc_handler: Option<WebviewIpcHandler<T, QtRuntime<T>>>,
-  navigation_handler: Option<Box<dyn Fn(&Url) -> bool + Send>>,
-  new_window_handler:
-    Option<Box<dyn Fn(Url, NewWindowFeatures<T, QtRuntime<T>>) -> NewWindowResponse + Send + Sync>>,
-  title_handler: Option<Box<dyn Fn(String) + Send>>,
-  page_load_handler: Option<Box<dyn Fn(Url, PageLoadEvent) + Send>>,
-  download_handler: Option<Arc<dyn Fn(DownloadEvent) -> bool + Send + Sync>>,
+  navigation_handler: Option<Box<NavigationHandler>>,
+  new_window_handler: Option<Box<NewWindowHandler<T, QtRuntime<T>>>>,
+  title_handler: Option<Box<DocumentTitleChangedHandler>>,
+  page_load_handler: Option<Box<OnPageLoadHandler>>,
+  download_handler: Option<Arc<DownloadHandler>>,
   permission_handler: Option<Box<dyn Fn(PermissionKind) -> PermissionResponse + Send + Sync>>,
-  terminate_handler: Option<Box<dyn Fn(WebContentProcessTermination) + Send>>,
+  terminate_handler: Option<Box<OnWebContentProcessTerminateHandler>>,
 }
 
 pub(crate) struct MainState<T: UserEvent> {
@@ -309,8 +315,8 @@ pub(crate) struct MainState<T: UserEvent> {
   /// Qt window id -> Tauri window id.
   window_ids: RefCell<HashMap<u64, WindowId>>,
   webviews: RefCell<HashMap<u32, Rc<WebviewMeta<T>>>>,
-  protocols: RefCell<HashMap<u32, HashMap<String, Arc<ProtocolHandler>>>>,
-  callback: RefCell<Option<Box<dyn FnMut(RunEvent<T>)>>>,
+  protocols: RefCell<HashMap<u32, HashMap<String, Arc<UriSchemeProtocolHandler>>>>,
+  callback: RefCell<Option<RunCallback<T>>>,
   queue: RefCell<VecDeque<RunEvent<T>>>,
 }
 
@@ -449,7 +455,7 @@ pub(crate) fn exit_requested<T: UserEvent>(st: &MainState<T>, code: Option<i32>)
   let (tx, rx) = channel();
   st.emit(RunEvent::ExitRequested { code, tx });
   if !matches!(rx.try_recv(), Ok(ExitRequestedEventAction::Prevent)) {
-    qt_webview::quit(code.unwrap_or(0));
+    app::quit(code.unwrap_or(0));
   }
 }
 
@@ -472,7 +478,7 @@ pub(crate) fn create_window<T: UserEvent>(
     .next_window_id
     .fetch_add(1, Ordering::Relaxed);
   let id = WindowId::from(raw_id);
-  let window = qt_webview::Window::new(raw_id as u64, b.transparent);
+  let window = webengine::Window::new(raw_id as u64, b.transparent);
   window.set_title(&b.title);
 
   let scale = window.scale_factor();
@@ -510,7 +516,7 @@ pub(crate) fn create_window<T: UserEvent>(
   window.resize(util::round(w), util::round(h));
   window.set_resizable(b.resizable);
 
-  use qt_webview::WindowFlag;
+  use qtshim::webengine::WindowFlag;
   if !b.decorations {
     window.set_flag(WindowFlag::Decorations, false);
   }
@@ -538,14 +544,19 @@ pub(crate) fn create_window<T: UserEvent>(
   if let Some(icon) = &b.icon {
     window.set_icon(&icon.rgba, icon.width, icon.height);
   }
-  if let Some(parent) = b.transient_parent {
-    window.set_transient_for_widget(parent as *mut std::ffi::c_void);
+  // `tauri` takes `transient_parent` from the parent window's `qt_window()`; it's validated
+  // here anyway.
+  if let Some(parent) = b
+    .transient_parent
+    .and_then(|p| qtshim::menu::Widget::from_ptr(p as *mut std::ffi::c_void))
+  {
+    window.set_transient_for_widget(&parent);
   }
   if let Some(c) = b.background_color {
     window.set_background(Some(c.into()));
   }
   if let Some(theme) = b.theme {
-    qt_webview::set_color_scheme(Some(color_scheme(theme)));
+    app::set_color_scheme(Some(color_scheme(theme)));
   }
   if let Some((x, y)) = b.position {
     window.move_to(util::round(x), util::round(y));
@@ -633,31 +644,30 @@ pub(crate) fn create_webview<T: UserEvent>(
     permission_request_handler,
     on_web_content_process_terminate_handler,
     opener,
-    runtime_specific_attributes: _,
     ..
   } = pending;
 
   for scheme in uri_scheme_protocols.keys() {
-    if !qt_webview::register_scheme(scheme, SchemeFlags::APP) {
+    if !webengine::register_scheme(scheme, SchemeFlags::APP) {
       log::warn!(
         "custom scheme `{scheme}` was registered after the web engine started; QtWebEngine \
          will not route it (register it on the first webview)"
       );
     }
   }
-  if !qt_webview::engine_started() {
+  if !webengine::engine_started() {
     if let Some(args) = &attrs.additional_browser_args {
-      qt_webview::add_chromium_flags(args);
+      webengine::add_chromium_flags(args);
     }
     if let Some(proxy) = &attrs.proxy_url {
       let kind = match proxy.scheme() {
-        "http" => Some(qt_webview::ProxyKind::Http),
-        "socks5" => Some(qt_webview::ProxyKind::Socks5),
+        "http" => Some(webengine::ProxyKind::Http),
+        "socks5" => Some(webengine::ProxyKind::Socks5),
         _ => None,
       };
       match (kind, proxy.host_str()) {
         (Some(kind), Some(host)) => {
-          qt_webview::set_proxy(kind, host, proxy.port_or_known_default().unwrap_or(80))
+          webengine::set_proxy(kind, host, proxy.port_or_known_default().unwrap_or(80))
         }
         _ => return Err(Error::InvalidProxyUrl),
       }
@@ -746,7 +756,7 @@ pub(crate) fn create_webview<T: UserEvent>(
     webview_id,
     uri_scheme_protocols
       .into_iter()
-      .map(|(k, v)| (k, Arc::<ProtocolHandler>::from(v)))
+      .map(|(k, v)| (k, Arc::<UriSchemeProtocolHandler>::from(v)))
       .collect(),
   );
 
@@ -796,16 +806,16 @@ pub(crate) fn rates(x: i32, y: i32, w: i32, h: i32, ww: i32, wh: i32) -> Option<
   })
 }
 
-pub(crate) fn color_scheme(theme: Theme) -> qt_webview::ColorScheme {
+pub(crate) fn color_scheme(theme: Theme) -> app::ColorScheme {
   match theme {
-    Theme::Dark => qt_webview::ColorScheme::Dark,
-    _ => qt_webview::ColorScheme::Light,
+    Theme::Dark => app::ColorScheme::Dark,
+    _ => app::ColorScheme::Light,
   }
 }
 
 pub(crate) fn current_theme() -> Theme {
-  match qt_webview::color_scheme() {
-    Some(qt_webview::ColorScheme::Dark) => Theme::Dark,
+  match app::color_scheme() {
+    Some(app::ColorScheme::Dark) => Theme::Dark,
     _ => Theme::Light,
   }
 }
@@ -1117,7 +1127,7 @@ fn handle_view_event<T: UserEvent>(st: &MainState<T>, ev: &Event) -> Reply {
   }
 }
 
-fn handle_scheme<T: UserEvent>(req: qt_webview::SchemeRequest, responder: qt_webview::Responder) {
+fn handle_scheme<T: UserEvent>(req: webengine::SchemeRequest, responder: webengine::Responder) {
   let Some(st) = state::<T>() else {
     return;
   };
@@ -1250,7 +1260,7 @@ impl<T: UserEvent> QtRuntime<T> {
       runtime_init_attrs: attrs,
     } = args;
     let app_id = app_id.or_else(|| (!identifier.is_empty()).then_some(identifier));
-    let info = qt_webview::init(app_id.as_deref());
+    let info = app::init(app_id.as_deref());
     log::debug!("Qt runtime: {info}");
     if !info.contains("Glib") {
       log::warn!(
@@ -1262,13 +1272,13 @@ impl<T: UserEvent> QtRuntime<T> {
       .copied()
       .chain(custom_schemes.iter().map(String::as_str))
     {
-      qt_webview::register_scheme(scheme, SchemeFlags::APP);
+      webengine::register_scheme(scheme, SchemeFlags::APP);
     }
     for flags in &attrs.chromium_flags {
-      qt_webview::add_chromium_flags(flags);
+      webengine::add_chromium_flags(flags);
     }
     if let Some(port) = attrs.remote_debugging_port {
-      qt_webview::add_chromium_flags(&format!("--remote-debugging-port={port}"));
+      webengine::add_chromium_flags(&format!("--remote-debugging-port={port}"));
     }
 
     let context = Context {
@@ -1292,8 +1302,8 @@ impl<T: UserEvent> QtRuntime<T> {
       queue: Default::default(),
     });
     STATE.with(|s| *s.borrow_mut() = Some(st as Rc<dyn Any>));
-    qt_webview::set_event_handler(handle_event::<T>);
-    qt_webview::set_scheme_handler(handle_scheme::<T>);
+    app::set_event_handler(handle_event::<T>);
+    webengine::set_scheme_handler(handle_scheme::<T>);
 
     Ok(Self {
       context,
@@ -1312,16 +1322,16 @@ impl<T: UserEvent> QtRuntime<T> {
       drop(cb);
     }
     self.context.shared.alive.store(false, Ordering::Release);
-    qt_webview::shutdown();
+    app::shutdown();
     STATE.with(|s| s.borrow_mut().take());
   }
 }
 
 pub(crate) fn display_handle_raw() -> Option<RawDisplayHandle> {
   use raw_window_handle::{WaylandDisplayHandle, XlibDisplayHandle};
-  match qt_webview::native_display()? {
-    qt_webview::NativeHandle::Wayland(p) => Some(WaylandDisplayHandle::new(p).into()),
-    qt_webview::NativeHandle::X11(d) => {
+  match app::native_display()? {
+    app::NativeHandle::Wayland(p) => Some(WaylandDisplayHandle::new(p).into()),
+    app::NativeHandle::X11(d) => {
       Some(XlibDisplayHandle::new(std::ptr::NonNull::new(d as *mut std::ffi::c_void), 0).into())
     }
   }
@@ -1332,9 +1342,9 @@ pub(crate) fn display_handle_raw() -> Option<RawDisplayHandle> {
 pub(crate) struct SendHandle(pub(crate) Option<(u8, usize)>);
 
 pub(crate) fn display_handle_send() -> SendHandle {
-  SendHandle(qt_webview::native_display().map(|h| match h {
-    qt_webview::NativeHandle::Wayland(p) => (1, p.as_ptr() as usize),
-    qt_webview::NativeHandle::X11(d) => (2, d),
+  SendHandle(app::native_display().map(|h| match h {
+    app::NativeHandle::Wayland(p) => (1, p.as_ptr() as usize),
+    app::NativeHandle::X11(d) => (2, d),
   }))
 }
 
@@ -1430,7 +1440,7 @@ impl<T: UserEvent> RuntimeHandle<T> for QtHandle<T> {
   fn set_theme(&self, theme: Option<Theme>) {
     let _ = self
       .context
-      .post(move |_| qt_webview::set_color_scheme(theme.map(color_scheme)));
+      .post(move |_| app::set_color_scheme(theme.map(color_scheme)));
   }
 
   fn set_device_event_filter(&self, _filter: DeviceEventFilter) {}
@@ -1441,26 +1451,26 @@ impl<T: UserEvent> RuntimeHandle<T> for QtHandle<T> {
   }
 
   fn webview_version(&self) -> Result<String> {
-    Ok(qt_webview::engine_version())
+    Ok(webengine::engine_version())
   }
 }
 
 pub(crate) fn primary_monitor() -> Option<Monitor> {
-  qt_webview::screens()
+  app::screens()
     .iter()
     .find(|s| s.primary)
     .map(util::monitor_from_screen)
 }
 
 pub(crate) fn available_monitors() -> Vec<Monitor> {
-  qt_webview::screens()
+  app::screens()
     .iter()
     .map(util::monitor_from_screen)
     .collect()
 }
 
 pub(crate) fn cursor_position() -> Result<PhysicalPosition<f64>> {
-  let (x, y, s) = qt_webview::cursor_position().ok_or(Error::FailedToGetCursorPosition)?;
+  let (x, y, s) = app::cursor_position().ok_or(Error::FailedToGetCursorPosition)?;
   Ok(PhysicalPosition::new(x as f64 * s, y as f64 * s))
 }
 
@@ -1541,7 +1551,7 @@ impl<T: UserEvent> Runtime<T> for QtRuntime<T> {
   }
 
   fn set_theme(&self, theme: Option<Theme>) {
-    qt_webview::set_color_scheme(theme.map(color_scheme));
+    app::set_color_scheme(theme.map(color_scheme));
   }
 
   fn set_device_event_filter(&mut self, _filter: DeviceEventFilter) {}
@@ -1551,7 +1561,7 @@ impl<T: UserEvent> Runtime<T> for QtRuntime<T> {
       *st.callback.borrow_mut() = Some(Box::new(callback));
       st.flush();
     }
-    qt_webview::process_events();
+    app::process_events();
   }
 
   fn run_return<F: FnMut(RunEvent<T>) + 'static>(self, callback: F) -> i32 {
@@ -1565,7 +1575,7 @@ impl<T: UserEvent> Runtime<T> for QtRuntime<T> {
       st.queue.borrow_mut().push_front(RunEvent::Ready);
       st.flush();
     });
-    let code = qt_webview::exec();
+    let code = app::exec();
     if let Some(st) = state::<T>() {
       st.emit(RunEvent::Exit);
     }
