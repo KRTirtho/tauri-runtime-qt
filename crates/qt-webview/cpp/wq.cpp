@@ -19,6 +19,8 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonValue>
+#include <QMenu>
+#include <QMenuBar>
 #include <QMessageBox>
 #include <QMimeData>
 #include <QNetworkCookie>
@@ -30,6 +32,7 @@
 #include <QStyleHints>
 #include <QThread>
 #include <QTimer>
+#include <QVBoxLayout>
 #include <QWebChannel>
 #include <QWebEngineCookieStore>
 #include <QWebEngineDesktopMediaRequest>
@@ -272,8 +275,19 @@ struct WqWindow : public QWidget {
   QList<WqView *> views;
   bool cursorHidden = false;
   int cursorShape = Qt::ArrowCursor;
+  // Webviews live in `content`, below an optional menubar that muda puts at the top of the
+  // layout (QLayout::setMenuBar).
+  QWidget *content = nullptr;
 
-  explicit WqWindow(quint64 id) : QWidget(nullptr), id(id) {}
+  explicit WqWindow(quint64 id) : QWidget(nullptr), id(id) {
+    auto *layout = new QVBoxLayout(this);
+    layout->setContentsMargins(0, 0, 0, 0);
+    layout->setSpacing(0);
+    content = new QWidget(this);
+    content->setObjectName(QStringLiteral("wq-content"));
+    layout->addWidget(content);
+    content->installEventFilter(this);
+  }
 
   void applySizeConstraints() {
     if (!resizable) {
@@ -306,6 +320,11 @@ struct WqWindow : public QWidget {
   void layoutViews();
 
 protected:
+  bool eventFilter(QObject *o, QEvent *e) override {
+    if (o == content && e->type() == QEvent::Resize)
+      layoutViews();
+    return QWidget::eventFilter(o, e);
+  }
   void resizeEvent(QResizeEvent *e) override {
     QWidget::resizeEvent(e);
     layoutViews();
@@ -383,7 +402,7 @@ struct WqView {
 void WqWindow::layoutViews() {
   for (WqView *v : views)
     if (v->fill || v->fullscreen)
-      v->view->setGeometry(rect());
+      v->view->setGeometry(content->rect());
 }
 
 class WqPage : public QWebEnginePage {
@@ -1091,6 +1110,130 @@ int wq_window_native(WqWindow *w, int *kind, void **handle) {
   return 0;
 }
 
+void *wq_window_qwidget(WqWindow *w) { return static_cast<QWidget *>(w); }
+
+void wq_window_content_size(WqWindow *w, int32_t *width, int32_t *height) {
+  *width = w->content->width();
+  *height = w->content->height();
+}
+
+void wq_window_set_transient_for_widget(WqWindow *w, void *parent) {
+  auto *p = static_cast<QWidget *>(parent);
+  if (!p)
+    return;
+  w->winId();
+  p->window()->winId();
+  if (w->windowHandle() && p->window()->windowHandle())
+    w->windowHandle()->setTransientParent(p->window()->windowHandle());
+}
+
+// --- debugging helpers (menus) -------------------------------------------------------------
+
+static QString actionLabel(const QAction *a) {
+  QString t = a->text().section(QLatin1Char('\t'), 0, 0);
+  t.replace(QLatin1String("&&"), QStringLiteral("\x01"));
+  t.remove(QLatin1Char('&'));
+  t.replace(QStringLiteral("\x01"), QStringLiteral("&"));
+  return t;
+}
+
+static void dumpMenu(const QWidget *container, int depth, QString &out) {
+  for (const QAction *a : container->actions()) {
+    out += QString(depth * 2, QLatin1Char(' '));
+    if (a->isSeparator()) {
+      out += QStringLiteral("---\n");
+      continue;
+    }
+    if (a->isCheckable())
+      out += a->isChecked() ? QStringLiteral("[x] ") : QStringLiteral("[ ] ");
+    out += actionLabel(a);
+    const QString hint = a->text().section(QLatin1Char('\t'), 1);
+    if (!a->shortcut().isEmpty())
+      out += QStringLiteral(" <") + a->shortcut().toString(QKeySequence::PortableText) +
+             QStringLiteral(">");
+    else if (!hint.isEmpty())
+      out += QStringLiteral(" (") + hint + QStringLiteral(")");
+    if (!a->isEnabled())
+      out += QStringLiteral(" {disabled}");
+    out += QLatin1Char('\n');
+    if (a->menu())
+      dumpMenu(a->menu(), depth + 1, out);
+  }
+}
+
+// Records context menus when Qt shows them: on Wayland a popup opened without user input may
+// be dismissed by the compositor right away, before a test could look at it.
+static QString g_lastPopup;
+class PopupWatcher : public QObject {
+public:
+  using QObject::QObject;
+  bool eventFilter(QObject *o, QEvent *e) override {
+    if (e->type() == QEvent::Show)
+      if (auto *menu = qobject_cast<QMenu *>(o);
+          menu && !qobject_cast<QMenuBar *>(menu->parentWidget()) &&
+          !qobject_cast<QMenu *>(menu->parentWidget())) {
+        g_lastPopup.clear();
+        dumpMenu(menu, 0, g_lastPopup);
+      }
+    return false;
+  }
+};
+static void watchPopups() {
+  static PopupWatcher *watcher = nullptr;
+  if (!watcher && qApp) {
+    watcher = new PopupWatcher(qApp);
+    qApp->installEventFilter(watcher);
+  }
+}
+
+char *wq_debug_menubar(void *widget) {
+  watchPopups();
+  QString out;
+  auto *w = static_cast<QWidget *>(widget);
+  if (QMenuBar *bar = w->findChild<QMenuBar *>())
+    dumpMenu(bar, 0, out);
+  return strdup(out.toUtf8().constData());
+}
+
+char *wq_debug_take_popup(void) {
+  watchPopups();
+  QString out = g_lastPopup;
+  g_lastPopup.clear();
+  if (auto *menu = qobject_cast<QMenu *>(QApplication::activePopupWidget())) {
+    if (out.isEmpty())
+      dumpMenu(menu, 0, out);
+    menu->close();
+  }
+  return strdup(out.toUtf8().constData());
+}
+
+int wq_debug_trigger(void *widget, const char *path) {
+  auto *w = static_cast<QWidget *>(widget);
+  QMenuBar *bar = w->findChild<QMenuBar *>();
+  if (!bar)
+    return 0;
+  const QStringList parts = QString::fromUtf8(path).split(QLatin1Char('/'));
+  const QWidget *container = bar;
+  for (int i = 0; i < parts.size(); ++i) {
+    QAction *found = nullptr;
+    for (QAction *a : container->actions())
+      if (!a->isSeparator() && actionLabel(a) == parts[i]) {
+        found = a;
+        break;
+      }
+    if (!found)
+      return 0;
+    if (i + 1 == parts.size()) {
+      found->trigger();
+      return 1;
+    }
+    if (!found->menu())
+      return 0;
+    container = found->menu();
+  }
+  return 0;
+}
+
 // --- profiles ------------------------------------------------------------------------------
 
 WqProfile *wq_profile_get(const char *storage_dir, int incognito) {
@@ -1214,7 +1357,7 @@ WqView *wq_view_new(uint64_t id, WqWindow *parent, WqProfile *profile, uint32_t 
   v->profile = profile;
   v->fill = flags & WQ_VIEW_FILL;
   v->dragHandler = flags & WQ_VIEW_DRAG_HANDLER;
-  v->view = new QWebEngineView(parent);
+  v->view = new QWebEngineView(parent->content);
   v->page = new WqPage(profile->p, v->view);
   v->page->owner = v;
   v->page->setUrlRequestInterceptor(new ViewTagger(id, v->page));
@@ -1246,7 +1389,7 @@ WqView *wq_view_new(uint64_t id, WqWindow *parent, WqProfile *profile, uint32_t 
   g_views.insert(id, v);
   g_pageViews.insert(v->page, v);
   if (v->fill)
-    v->view->setGeometry(parent->rect());
+    v->view->setGeometry(parent->content->rect());
   v->view->show();
   if (flags & WQ_VIEW_FOCUS)
     v->view->setFocus();
@@ -1291,9 +1434,9 @@ void wq_view_reparent(WqView *v, WqWindow *parent) {
     v->win->views.removeAll(v);
   v->win = parent;
   parent->views.append(v);
-  v->view->setParent(parent);
+  v->view->setParent(parent->content);
   if (v->fill)
-    v->view->setGeometry(parent->rect());
+    v->view->setGeometry(parent->content->rect());
   v->view->show();
 }
 
@@ -1303,7 +1446,7 @@ void wq_view_set_fill(WqView *v, int fill) {
 
   v->fill = fill != 0;
   if (v->fill)
-    v->view->setGeometry(v->win->rect());
+    v->view->setGeometry(v->win->content->rect());
 }
 void wq_view_set_bounds(WqView *v, int32_t x, int32_t y, int32_t w, int32_t h) {
   if (v->dead)

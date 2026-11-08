@@ -191,6 +191,20 @@ void wq_window_fullscreen_on(WqWindow *w, int32_t x, int32_t y);
 void wq_window_set_transient_for(WqWindow *w, WqWindow *parent);
 // kind: 1 wayland (wl_surface*), 2 x11 (Window id in *handle). Returns 0 if unavailable.
 int wq_window_native(WqWindow *w, int *kind, void **handle);
+// The window's QWidget* (for muda's Qt backend / tauri's `qt_window`).
+void *wq_window_qwidget(WqWindow *w);
+// Logical size of the area holding the webviews (the window minus its menubar, if any).
+void wq_window_content_size(WqWindow *w, int32_t *width, int32_t *height);
+// Make `w` transient for the window containing `parent` (any QWidget*).
+void wq_window_set_transient_for_widget(WqWindow *w, void *parent);
+
+// Debugging helpers: dump the menubar of `widget` as an indented tree (free with wq_free), and
+// trigger the item at `path` ("File/Save"). Return value of trigger: 1 if found.
+char *wq_debug_menubar(void *widget);
+int wq_debug_trigger(void *widget, const char *path);
+// Dump the last context menu Qt showed (empty if none since the previous call) and close it if
+// it's still open. Recording starts with the first call to a wq_debug_* function.
+char *wq_debug_take_popup(void);
 
 // ---------------------------------------------------------------------------------------------
 // profiles (one per data directory / incognito; starts the web engine on first use)

@@ -790,6 +790,20 @@ impl Window {
   pub fn set_transient_for(&self, parent: &Window) {
     unsafe { ffi::wq_window_set_transient_for(self.p(), parent.p()) }
   }
+  /// The window's `QWidget*`.
+  pub fn qwidget(&self) -> *mut c_void {
+    unsafe { ffi::wq_window_qwidget(self.p()) }
+  }
+  /// Logical size of the area holding the views (excludes a menubar).
+  pub fn content_size(&self) -> (i32, i32) {
+    let (mut w, mut h) = (0, 0);
+    unsafe { ffi::wq_window_content_size(self.p(), &mut w, &mut h) };
+    (w, h)
+  }
+  /// Make this window transient for the window containing `parent` (a `QWidget*`).
+  pub fn set_transient_for_widget(&self, parent: *mut c_void) {
+    unsafe { ffi::wq_window_set_transient_for_widget(self.p(), parent) }
+  }
   pub fn native_handle(&self) -> Option<NativeHandle> {
     let mut kind = 0;
     let mut ptr = std::ptr::null_mut();
@@ -863,8 +877,7 @@ impl std::fmt::Debug for View {
 impl View {
   /// `id` is echoed back in every event of this view and identifies its scheme requests.
   pub fn new(id: u64, window: &Window, profile: Profile, options: ViewOptions) -> Self {
-    let raw =
-      unsafe { ffi::wq_view_new(id, window.p(), profile.0.as_ptr(), options.bits()) };
+    let raw = unsafe { ffi::wq_view_new(id, window.p(), profile.0.as_ptr(), options.bits()) };
     Self {
       raw: NonNull::new(raw).unwrap(),
       _not_send: PhantomData,
@@ -937,12 +950,20 @@ impl View {
   }
   /// Inject `js` at document creation for every subsequent navigation.
   pub fn add_init_script(&self, js: &str, main_frame_only: bool) {
-    unsafe { ffi::wq_view_add_init_script(self.p(), cstring(js).as_ptr(), main_frame_only as c_int) }
+    unsafe {
+      ffi::wq_view_add_init_script(self.p(), cstring(js).as_ptr(), main_frame_only as c_int)
+    }
   }
   /// Evaluate `js` without waiting for the result.
   pub fn eval(&self, js: &str) {
     unsafe {
-      ffi::wq_view_eval(self.p(), cstring(js).as_ptr(), None, std::ptr::null_mut(), None)
+      ffi::wq_view_eval(
+        self.p(),
+        cstring(js).as_ptr(),
+        None,
+        std::ptr::null_mut(),
+        None,
+      )
     }
   }
   /// Evaluate `js`; `callback` receives the JSON-serialised result.
@@ -996,5 +1017,27 @@ mod tests {
   fn content_range() {
     assert_eq!(super::parse_content_range("bytes 2-4/10"), Some((2, 10)));
     assert_eq!(super::parse_content_range("bytes 0-0/*"), None);
+  }
+}
+
+/// Debugging helpers for the menubar muda installs on a window.
+pub mod debug {
+  use super::*;
+
+  /// The menubar of `widget` (a `QWidget*`) as an indented tree: `[x]` for checked items,
+  /// `<Ctrl+N>` for registered shortcuts, `(Ctrl+C)` for display-only ones. Main thread only.
+  pub fn menubar_tree(widget: *mut c_void) -> String {
+    unsafe { take_cstring(ffi::wq_debug_menubar(widget)) }
+  }
+
+  /// The last context menu Qt showed (since the previous call) as a tree, or an empty string;
+  /// closes it if still open. Recording starts with the first call to any helper here.
+  pub fn take_popup_menu() -> String {
+    unsafe { take_cstring(ffi::wq_debug_take_popup()) }
+  }
+
+  /// Trigger the menubar item at `path` (e.g. `"File/Save"`). Returns `false` if not found.
+  pub fn trigger_menu_item(widget: *mut c_void, path: &str) -> bool {
+    unsafe { ffi::wq_debug_trigger(widget, cstring(path).as_ptr()) != 0 }
   }
 }

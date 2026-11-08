@@ -51,9 +51,51 @@ Runtime dependency for packages: `qt6-qtwebengine` (rpm), `libqt6webenginewidget
 ### Running the example
 
 ```sh
-cargo run -p qt-app                       # interactive (camera / screen-share buttons)
-QT_APP_AUTO=1 cargo run -p qt-app         # self-test: commands, events, windows, popups, history, schemes, WebRTC
+cargo run -p qt-app                       # interactive showcase of (nearly) every Tauri API
+QT_APP_AUTO=1 cargo run -p qt-app         # self-test: IPC, events, windows, popups, history, menus, schemes, WebRTC
+QT_APP_AUTO=smoke cargo run -p qt-app     # clicks through the showcase controls and checks each result
+QT_APP_AUTO=crash cargo run -p qt-app     # kills the renderer once and checks the page recovers
 ```
+
+The showcase is grouped into sections:
+- **About:** engine, Tauri and app info, monitors, cursor position.
+- **Commands & events:** sync, async and failing commands, events both ways, `eval` from Rust.
+- **Window:** title, minimize, maximize, fullscreen, hide/show, always-on-top, decorations,
+  resizable, close prevention, size, position, cursor, theme, progress/badge, drag region.
+- **Webview & DevTools:** open/close/toggle (F12 menu item, Ctrl+Shift+I), zoom, background,
+  history, navigation (plus a link blocked by `on_navigation`), print, clear data, cookies.
+- **Windows & webviews:** new windows (with and without a parent), `window.open` popups,
+  auto-resizing child webviews.
+- **Menus:** the Qt menubar (shortcuts, check items, theme submenu, About), a right-click context
+  menu from the JS `Menu` API, live renaming, and a tray icon.
+- **Media:** camera/microphone and screen sharing (through the runtime's permission prompt),
+  WebRTC, codecs, WebGL, element fullscreen.
+- **Files & protocols:** drag & drop events, downloads, `stream://` with byte ranges, and killing
+  the renderer to exercise `on_web_content_process_terminate`.
+
+A live event log shows every hook firing.
+
+## Menus
+
+Window menus and context menus are real Qt menus. Choosing this runtime turns on `tauri`'s `qt`
+feature, which sends menus to a new Qt backend in [muda](https://github.com/tauri-apps/muda), so
+the normal Tauri APIs work unchanged: `Builder::menu`, `Window::set_menu` / `remove_menu` /
+`hide_menu` / `show_menu`, `on_menu_event`, `Menu::popup`, and the JS `Menu` API.
+
+- Accelerators become Qt shortcuts (active while the window is focused). Clipboard items (Copy,
+  Paste, …) only *display* their shortcut, so they don't take keys from the page.
+- Predefined items work: Copy, Cut, Paste, Select All, Undo, Redo, Minimize, Maximize,
+  Fullscreen, Hide, Close Window (goes through Tauri's close handling), Quit, and About (a Qt
+  dialog). macOS-only items render disabled.
+- Changes (`set_text`, `set_enabled`, `set_checked`, adding/removing items) rebuild the menubar
+  on the next event loop turn.
+- `WebviewWindowBuilder::parent` / `transient_for` no longer fail: the new window is made
+  transient for the parent's Qt window (`QWindow::setTransientParent`).
+
+This needs changes that aren't released yet: muda's `qt` backend (`../muda`, branch
+`qt-backend`, based on muda 0.20.0) and `tauri`'s `qt` feature plus
+`WindowDispatch::qt_window` (`../tauri`, branch `qt-support`, based on Tauri v3). The workspace
+`Cargo.toml` patches both in from those sibling checkouts.
 
 ## How it works
 
@@ -85,8 +127,6 @@ QT_APP_AUTO=1 cargo run -p qt-app         # self-test: commands, events, windows
 
 ## Limitations
 
-- **Menus.** `gtk_window()` and `default_vbox()` return an error and no GTK version is declared,
-  so muda window menubars and `popup_menu` aren't available. Tray icons (ksni) work.
 - **Positioning on Wayland.** Wayland doesn't let apps place windows or warp the pointer, so
   `set_position`, `center` and `set_cursor_position` only work on X11.
 - **Status codes.** QtWebEngine scheme handlers can't send arbitrary HTTP status codes. Bodies

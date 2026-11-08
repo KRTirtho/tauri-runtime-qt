@@ -81,7 +81,10 @@ fn main() {
   let include_dir = PathBuf::from(pkg_config(&["--variable=includedir", "Qt6Gui"]));
   let version = pkg_config(&["--modversion", "Qt6Gui"]);
   let gui_private = include_dir.join("QtGui").join(&version);
-  if gui_private.join("QtGui/qpa/qplatformnativeinterface.h").exists() {
+  if gui_private
+    .join("QtGui/qpa/qplatformnativeinterface.h")
+    .exists()
+  {
     let core_private = include_dir.join("QtCore").join(&version);
     build
       .include(&gui_private)

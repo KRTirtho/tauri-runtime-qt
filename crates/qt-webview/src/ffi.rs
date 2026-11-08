@@ -113,6 +113,12 @@ unsafe extern "C" {
   pub fn wq_window_fullscreen_on(w: *mut WqWindow, x: i32, y: i32);
   pub fn wq_window_set_transient_for(w: *mut WqWindow, parent: *mut WqWindow);
   pub fn wq_window_native(w: *mut WqWindow, kind: *mut c_int, handle: *mut *mut c_void) -> c_int;
+  pub fn wq_window_qwidget(w: *mut WqWindow) -> *mut c_void;
+  pub fn wq_window_content_size(w: *mut WqWindow, width: *mut i32, height: *mut i32);
+  pub fn wq_window_set_transient_for_widget(w: *mut WqWindow, parent: *mut c_void);
+  pub fn wq_debug_menubar(widget: *mut c_void) -> *mut c_char;
+  pub fn wq_debug_trigger(widget: *mut c_void, path: *const c_char) -> c_int;
+  pub fn wq_debug_take_popup() -> *mut c_char;
 
   pub fn wq_profile_get(dir: *const c_char, incognito: c_int) -> *mut WqProfile;
   pub fn wq_profile_set_user_agent(p: *mut WqProfile, ua: *const c_char);
@@ -121,7 +127,12 @@ unsafe extern "C" {
   pub fn wq_profile_delete_cookie(p: *mut WqProfile, c: *const c_char, origin: *const c_char);
   pub fn wq_profile_clear_data(p: *mut WqProfile);
 
-  pub fn wq_view_new(id: u64, parent: *mut WqWindow, profile: *mut WqProfile, flags: u32) -> *mut WqView;
+  pub fn wq_view_new(
+    id: u64,
+    parent: *mut WqWindow,
+    profile: *mut WqProfile,
+    flags: u32,
+  ) -> *mut WqView;
   pub fn wq_view_destroy(v: *mut WqView);
   pub fn wq_view_reparent(v: *mut WqView, parent: *mut WqWindow);
   pub fn wq_view_set_fill(v: *mut WqView, fill: c_int);

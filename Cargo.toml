@@ -1,3 +1,14 @@
 [workspace]
 resolver = "3"
 members = ["crates/qt-webview", "crates/tauri-runtime-qt", "examples/qt-app"]
+
+# Qt menus need `tauri`'s `qt` feature and muda's Qt backend, which aren't released yet:
+# build against local checkouts (../tauri on branch `qt-support`, ../muda on `qt-backend`).
+[patch.crates-io]
+tauri = { path = "../tauri/crates/tauri" }
+tauri-runtime = { path = "../tauri/crates/tauri-runtime" }
+tauri-utils = { path = "../tauri/crates/tauri-utils" }
+tauri-macros = { path = "../tauri/crates/tauri-macros" }
+tauri-codegen = { path = "../tauri/crates/tauri-codegen" }
+tauri-build = { path = "../tauri/crates/tauri-build" }
+muda = { path = "../muda" }

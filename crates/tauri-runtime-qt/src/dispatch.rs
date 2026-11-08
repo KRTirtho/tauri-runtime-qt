@@ -14,18 +14,15 @@ use tauri_runtime::{
   dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize, Position, Rect, Size},
   monitor::Monitor,
   webview::{DetachedWebview, PendingWebview},
-  window::{
-    CursorIcon, DetachedWindow, PendingWindow, RawWindow, WindowId,
-    WindowSizeConstraints,
-  },
+  window::{CursorIcon, DetachedWindow, PendingWindow, RawWindow, WindowId, WindowSizeConstraints},
 };
 use tauri_utils::{Theme, config::Color};
 use url::Url;
 
 use crate::{
-  Context, MainState, QtRuntime, QtWebview, QtWindowBuilder, SendWrapper, WebviewEntry, WebviewKind,
-  WindowEntry, close_requested, color_scheme, create_webview, create_window, current_theme,
-  destroy_window, rates, util,
+  Context, MainState, QtRuntime, QtWebview, QtWindowBuilder, SendWrapper, WebviewEntry,
+  WebviewKind, WindowEntry, close_requested, color_scheme, create_webview, create_window,
+  current_theme, destroy_window, rates, util,
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -74,7 +71,7 @@ impl<T: UserEvent> QtWindowDispatcher<T> {
     F: FnOnce(&WindowEntry) + Send + 'static,
   {
     let id = self.window_id;
-    self.context.post(move |st| {
+    self.context.run_or_post(move |st| {
       if let Some(w) = st.windows.borrow().get(&id) {
         f(w)
       }
@@ -187,9 +184,9 @@ impl<T: UserEvent> WindowDispatch<T> for QtWindowDispatcher<T> {
   }
 
   fn monitor_from_point(&self, x: f64, y: f64) -> Result<Option<Monitor>> {
-    self.context.run_on_main(move |_| {
-      util::screen_at_physical(x, y).map(|s| util::monitor_from_screen(&s))
-    })
+    self
+      .context
+      .run_on_main(move |_| util::screen_at_physical(x, y).map(|s| util::monitor_from_screen(&s)))
   }
 
   fn available_monitors(&self) -> Result<Vec<Monitor>> {
@@ -206,9 +203,14 @@ impl<T: UserEvent> WindowDispatch<T> for QtWindowDispatcher<T> {
     Err(util::unsupported("default_vbox"))
   }
 
-  fn window_handle(
-    &self,
-  ) -> std::result::Result<WindowHandle<'_>, raw_window_handle::HandleError> {
+  /// The window's `QWidget*`; `tauri` installs muda's Qt menubar on it.
+  fn qt_window(&self) -> Result<*mut std::ffi::c_void> {
+    self
+      .with(|w| w.window.qwidget() as usize)
+      .map(|p| p as *mut std::ffi::c_void)
+  }
+
+  fn window_handle(&self) -> std::result::Result<WindowHandle<'_>, raw_window_handle::HandleError> {
     use raw_window_handle::{HandleError, WaylandWindowHandle, XlibWindowHandle};
     let handle = self
       .with(|w| {
@@ -346,13 +348,15 @@ impl<T: UserEvent> WindowDispatch<T> for QtWindowDispatcher<T> {
   fn set_min_size(&self, size: Option<Size>) -> Result<()> {
     self.act(move |w| {
       let scale = w.window.scale_factor();
-      w.window.set_min_size(size.map(|s| util::size_to_logical(s, scale)))
+      w.window
+        .set_min_size(size.map(|s| util::size_to_logical(s, scale)))
     })
   }
   fn set_max_size(&self, size: Option<Size>) -> Result<()> {
     self.act(move |w| {
       let scale = w.window.scale_factor();
-      w.window.set_max_size(size.map(|s| util::size_to_logical(s, scale)))
+      w.window
+        .set_max_size(size.map(|s| util::size_to_logical(s, scale)))
     })
   }
   fn set_size_constraints(&self, c: WindowSizeConstraints) -> Result<()> {
@@ -361,17 +365,19 @@ impl<T: UserEvent> WindowDispatch<T> for QtWindowDispatcher<T> {
       let l = |u: Option<tauri_runtime::dpi::PixelUnit>| {
         u.map(|u| util::round(util::unit_to_logical(u, scale)))
       };
-      let (min_w, min_h, max_w, max_h) =
-        (l(c.min_width), l(c.min_height), l(c.max_width), l(c.max_height));
+      let (min_w, min_h, max_w, max_h) = (
+        l(c.min_width),
+        l(c.min_height),
+        l(c.max_width),
+        l(c.max_height),
+      );
       w.window.set_min_size(
         (min_w.is_some() || min_h.is_some()).then(|| (min_w.unwrap_or(0), min_h.unwrap_or(0))),
       );
-      w.window.set_max_size((max_w.is_some() || max_h.is_some()).then(|| {
-        (
-          max_w.unwrap_or(i32::MAX / 2),
-          max_h.unwrap_or(i32::MAX / 2),
-        )
-      }));
+      w.window.set_max_size(
+        (max_w.is_some() || max_h.is_some())
+          .then(|| (max_w.unwrap_or(i32::MAX / 2), max_h.unwrap_or(i32::MAX / 2))),
+      );
     })
   }
   /// Wayland doesn't let clients position their windows; this only works on X11.
@@ -533,7 +539,7 @@ impl<T: UserEvent> QtWebviewDispatcher<T> {
   {
     let window_id = self.window_id.clone();
     let id = self.webview_id;
-    self.context.post(move |st| {
+    self.context.run_or_post(move |st| {
       let wid = *window_id.lock().unwrap();
       let windows = st.windows.borrow();
       if let Some(w) = windows.get(&wid)
@@ -733,7 +739,7 @@ impl<T: UserEvent> WebviewDispatch<T> for QtWebviewDispatcher<T> {
       let (width, height) = util::size_to_logical(bounds.size, scale);
       v.view.set_bounds(x, y, width, height);
       if v.auto_resize.get().is_some() {
-        let (_, _, ww, wh) = w.window.geometry().inner;
+        let (ww, wh) = w.window.content_size();
         v.auto_resize.set(rates(x, y, width, height, ww, wh));
       }
     })
@@ -825,7 +831,7 @@ impl<T: UserEvent> WebviewDispatch<T> for QtWebviewDispatcher<T> {
         return;
       }
       let (x, y, width, height) = v.view.bounds();
-      let (_, _, ww, wh) = w.window.geometry().inner;
+      let (ww, wh) = w.window.content_size();
       v.auto_resize.set(rates(x, y, width, height, ww, wh));
     })
   }

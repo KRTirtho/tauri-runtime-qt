@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A Tauri runtime for Linux that replaces tao + wry + WebKitGTK with Qt Widgets + QtWebEngine (Chromium). See README.md for user-facing usage and the list of known limitations.
 
-Branches: `tauri-v3` targets `tauri` 3.0.0-alpha.6 / `tauri-runtime` 3.0.0-alpha.5 (crates.io); `main` is the Tauri v2 (`tauri-runtime` 2.12) version. A local Tauri v3 checkout at `../tauri` (branch `v3`) is useful for reading `tauri-runtime-wry` / `tauri-runtime-cef`, the reference implementations.
+Branches: `qt-menus` (current) adds Qt menus and builds against unreleased local checkouts via `[patch.crates-io]` in the workspace `Cargo.toml`: `../muda` (branch `qt-backend`, muda 0.20.0 + a `qt` backend) and `../tauri` (branch `qt-support`, Tauri v3 + a `qt` feature and `WindowDispatch::qt_window`). `tauri-v3` targets `tauri` 3.0.0-alpha.6 / `tauri-runtime` 3.0.0-alpha.5 (crates.io); `main` is the Tauri v2 (`tauri-runtime` 2.12) version. A local Tauri v3 checkout at `../tauri` (branch `v3`) is useful for reading `tauri-runtime-wry` / `tauri-runtime-cef`, the reference implementations.
 
 ## Commands
 
@@ -15,11 +15,13 @@ cargo test -p tauri-runtime-qt cookie_matching   # single test by name
 
 QT_APP_AUTO=1 cargo run -p qt-app            # end-to-end self-test in a real Tauri app; exits 0 when all checks pass
 QT_APP_AUTO=close cargo run -p qt-app        # same, but exits by closing the last window (tests ExitRequested{code: None})
+QT_APP_AUTO=smoke cargo run -p qt-app        # clicks through the showcase UI (dist/app.js `smokeTest`) and checks the event log
+QT_APP_AUTO=crash cargo run -p qt-app        # kills the renderer (chrome://kill) once; on_web_content_process_terminate must reload
 cargo run -p qt-app                          # interactive (camera / screen-share buttons)
 RUST_LOG=tauri_runtime_qt=trace ...          # logs every scheme request/response and view event
 ```
 
-The self-test lives in `examples/qt-app/dist/index.html` (`runSelfTest`); each check reports through the `report` command and prints `[PASS]`/`[FAIL]` to stdout. Add a check there when adding runtime behaviour — it is the real regression suite.
+`examples/qt-app` is an interactive showcase (`dist/index.html`, `dist/app.js`, commands and hooks in `src/main.rs`) plus the regression suites: the self-test (`dist/selftest.js`, `runSelfTest`) and the showcase smoke test (`smokeTest` in `dist/app.js`). Each check reports through the `report` command and prints `[PASS]`/`[FAIL]` to stdout. Add a check when adding runtime behaviour.
 
 Requires Qt 6 WebEngine dev packages (Fedora: `qt6-qtwebengine-devel qt6-qtwebchannel-devel`, optionally `qt6-qtbase-private-devel`). `build.rs` finds Qt via `pkg-config`, runs `moc` (override with `QT_MOC`), and defines `WQ_HAVE_QPA` only if the QPA private header exists (needed for Wayland `wl_surface` handles).
 
@@ -61,4 +63,10 @@ In v3 the runtime delivers window/webview events only through the `RunEvent` cal
 - `run_return` → `teardown` drops windows, then `qt_webview::shutdown()` destroys profiles and `QApplication` in order.
 
 ### GTK
-The runtime has no GTK dependency and declares no `tauri_runtime::gtk` version; `gtk_window()`/`default_vbox()` return an error, so muda window menus are unavailable.
+The runtime has no GTK dependency and declares no `tauri_runtime::gtk` version; `gtk_window()`/`default_vbox()` return an error.
+
+### Menus (`qt-menus` branch)
+- `tauri-runtime-qt` depends on `tauri` with `features = ["qt"]`. That feature selects muda's Qt backend (`muda/qt`) and adds `#[cfg(qt)]` branches next to `tauri`'s `#[cfg(gtk)]` menu code, calling `menu.init_for_qt_window(window.qt_window())`, `show_context_menu_for_qt_window`, etc. The window/app menu is attached in `WindowBuilder::build` right after the runtime returns the window (Qt has no `after_window_creation` path).
+- `QtWindowDispatcher::qt_window` returns the `WqWindow` (`QWidget*`). Each `WqWindow` has a `QVBoxLayout` with a `content` widget holding the webviews; muda puts its `QMenuBar` at the top via `QLayout::setMenuBar`. So view geometry and auto-resize are relative to `content` (`Window::content_size`), not the window.
+- muda's Qt backend (`../muda/src/platform_impl/qt/`) rebuilds every attached menubar from muda's item state on any change (coalesced, posted to the Qt loop), tracks windows with `QPointer`, and reuses `MenuItemAction` for clicks.
+- `tauri_runtime_qt::debug::{menubar_tree, trigger_menu_item, take_popup_menu}` inspect/drive the Qt menus; the example's self-test uses them. On Wayland a popup opened without user input can be dismissed by the compositor immediately, which is why `take_popup_menu` reports the last popup *shown*.
