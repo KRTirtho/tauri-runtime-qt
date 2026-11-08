@@ -268,7 +268,10 @@ pub fn shutdown() {
   // channel another thread waits on) instead of leaking them.
   let dispatched = std::mem::take(&mut *lock_dispatched());
   let posted = POSTED.with(|p| std::mem::take(&mut *p.borrow_mut()));
-  drop((dispatched, posted));
+  // Their `Drop` may panic (e.g. by using Qt, which is stopped now): finish the shutdown anyway.
+  catch_panic("dropping closures queued at shutdown", move || {
+    drop((dispatched, posted))
+  });
   unsafe { sys::qs_app_shutdown() }
 }
 
@@ -448,7 +451,8 @@ pub fn native_display() -> Option<NativeHandle> {
   }
   match kind {
     1 => NonNull::new(ptr).map(NativeHandle::Wayland),
-    2 => Some(NativeHandle::X11(ptr as usize)),
+    // A null `Display*` (e.g. the offscreen platform) is no display.
+    2 if !ptr.is_null() => Some(NativeHandle::X11(ptr as usize)),
     _ => None,
   }
 }
@@ -466,5 +470,146 @@ pub fn launcher_update(desktop_file: Option<&str>, count: Option<i64>, progress:
       count.unwrap_or(-1),
       progress.unwrap_or(-1.0),
     )
+  }
+}
+
+// Unit tests run on libtest worker threads of one process: they never create the
+// `QApplication` (see `tests/qt` for that), so they only cover what works without it.
+#[cfg(test)]
+mod tests {
+  use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+  };
+
+  use super::*;
+
+  #[test]
+  fn event_kinds_from_raw() {
+    let known = [
+      (sys::QS_EV_WINDOW_RESIZED, EventKind::WindowResized),
+      (sys::QS_EV_WINDOW_MOVED, EventKind::WindowMoved),
+      (sys::QS_EV_WINDOW_CLOSE_REQ, EventKind::WindowCloseRequested),
+      (sys::QS_EV_WINDOW_FOCUS, EventKind::WindowFocus),
+      (sys::QS_EV_WINDOW_SCALE, EventKind::WindowScale),
+      (sys::QS_EV_THEME, EventKind::Theme),
+      (sys::QS_EV_VIEW_IPC, EventKind::ViewIpc),
+      (sys::QS_EV_VIEW_TITLE, EventKind::ViewTitle),
+      (sys::QS_EV_VIEW_LOAD, EventKind::ViewLoad),
+      (sys::QS_EV_VIEW_NAVIGATE, EventKind::ViewNavigate),
+      (sys::QS_EV_VIEW_NEW_WINDOW, EventKind::ViewNewWindow),
+      (sys::QS_EV_VIEW_PERMISSION, EventKind::ViewPermission),
+      (sys::QS_EV_VIEW_DOWNLOAD, EventKind::ViewDownload),
+      (sys::QS_EV_VIEW_DOWNLOAD_DONE, EventKind::ViewDownloadDone),
+      (sys::QS_EV_VIEW_DRAG, EventKind::ViewDrag),
+      (sys::QS_EV_VIEW_CRASHED, EventKind::ViewCrashed),
+      (sys::QS_EV_ABOUT_TO_BLOCK, EventKind::AboutToBlock),
+    ];
+    for (raw, kind) in known {
+      assert_eq!(EventKind::from_raw(raw), kind);
+    }
+    // Every raw value maps to a distinct kind.
+    let mut kinds: Vec<_> = known.iter().map(|(_, k)| format!("{k:?}")).collect();
+    kinds.sort();
+    kinds.dedup();
+    assert_eq!(kinds.len(), known.len());
+    assert_eq!(EventKind::from_raw(9999), EventKind::Unknown(9999));
+    assert_eq!(EventKind::from_raw(-1), EventKind::Unknown(-1));
+  }
+
+  #[test]
+  fn reply_defaults() {
+    let r = Reply::default();
+    assert_eq!((r.code, r.int, r.string), (-1, 0, None));
+    assert_eq!(
+      Reply::code(1),
+      Reply {
+        code: 1,
+        int: 0,
+        string: None
+      }
+    );
+  }
+
+  #[test]
+  fn screen_from_raw() {
+    let mut raw: sys::QsScreen = unsafe { std::mem::zeroed() };
+    for (dst, src) in raw.name.iter_mut().zip(b"HDMI-A-1") {
+      *dst = *src as c_char;
+    }
+    (raw.x, raw.y, raw.w, raw.h) = (10, 20, 1920, 1080);
+    (raw.ax, raw.ay, raw.aw, raw.ah) = (10, 50, 1920, 1050);
+    raw.scale = 1.5;
+    raw.primary = 1;
+    let s = Screen::from(&raw);
+    assert_eq!(
+      s,
+      Screen {
+        name: "HDMI-A-1".into(),
+        x: 10,
+        y: 20,
+        width: 1920,
+        height: 1080,
+        available_x: 10,
+        available_y: 50,
+        available_width: 1920,
+        available_height: 1050,
+        scale: 1.5,
+        primary: true,
+      }
+    );
+    raw.primary = 0;
+    raw.name = [0; 128];
+    let s = Screen::from(&raw);
+    assert!(!s.primary);
+    assert_eq!(s.name, "");
+  }
+
+  #[test]
+  fn not_running_on_test_threads() {
+    assert!(!is_running());
+  }
+
+  struct DropCount(Arc<AtomicUsize>);
+  impl Drop for DropCount {
+    fn drop(&mut self) {
+      self.0.fetch_add(1, Ordering::SeqCst);
+    }
+  }
+
+  #[test]
+  fn dispatch_without_app_drops_the_closure_at_once() {
+    let drops = Arc::new(AtomicUsize::new(0));
+    let guard = DropCount(drops.clone());
+    assert!(!dispatch(move || {
+      let _g = guard;
+      unreachable!()
+    }));
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    assert!(lock_dispatched().is_empty());
+  }
+
+  macro_rules! panics_without_app {
+    ($($name:ident: $call:expr;)*) => {$(
+      #[test]
+      #[should_panic(expected = "Qt can only be used on the thread that called `app::init`")]
+      fn $name() {
+        let _ = $call;
+      }
+    )*};
+  }
+
+  panics_without_app! {
+    exec_without_app: exec();
+    quit_without_app: quit(0);
+    process_events_without_app: process_events();
+    shutdown_without_app: shutdown();
+    post_without_app: post(|| {});
+    set_event_handler_without_app: set_event_handler(|_| Reply::default());
+    color_scheme_without_app: color_scheme();
+    set_color_scheme_without_app: set_color_scheme(None);
+    cursor_position_without_app: cursor_position();
+    native_display_without_app: native_display();
+    launcher_update_without_app: launcher_update(None, None, None);
   }
 }

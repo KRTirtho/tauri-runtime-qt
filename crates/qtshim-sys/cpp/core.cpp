@@ -28,6 +28,8 @@ static QList<void (*)()> &shutdownHooks() {
   return hooks;
 }
 
+int g_callbackDepth = 0;
+
 void registerShutdownHook(void (*hook)()) {
   if (!shutdownHooks().contains(hook))
     shutdownHooks().append(hook);
@@ -116,7 +118,13 @@ void qs_app_shutdown(void) {
 
 void qs_dispatch(qs_fn f, void *ud) {
   if (QCoreApplication *app = QCoreApplication::instance())
-    QMetaObject::invokeMethod(app, [f, ud] { f(ud); }, Qt::QueuedConnection);
+    QMetaObject::invokeMethod(
+        app,
+        [f, ud] {
+          CallbackScope scope;
+          f(ud);
+        },
+        Qt::QueuedConnection);
 }
 
 void qs_post(qs_fn f, void *ud) { qs_dispatch(f, ud); }

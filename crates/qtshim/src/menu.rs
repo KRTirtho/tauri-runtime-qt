@@ -123,11 +123,14 @@ pub struct Icon<'a> {
 impl Icon<'_> {
   /// The pixels and size as FFI arguments; null if the buffer is too small.
   fn raw(icon: Option<&Self>) -> (*const u8, c_int, c_int) {
-    match icon {
-      Some(i) if i.rgba.len() >= (i.width as usize) * (i.height as usize) * 4 => {
-        (i.rgba.as_ptr(), i.width as c_int, i.height as c_int)
-      }
-      _ => (std::ptr::null(), 0, 0),
+    match icon.and_then(|i| {
+      Some((
+        i.rgba.as_ptr(),
+        crate::util::rgba_dims(i.rgba.len(), i.width, i.height)?,
+      ))
+    }) {
+      Some((rgba, (w, h))) => (rgba, w, h),
+      None => (std::ptr::null(), 0, 0),
     }
   }
 }
@@ -368,12 +371,19 @@ impl PopupMenu {
       return;
     };
     let (has_pos, x, y, physical) = match position {
-      None => (0, 0.0, 0.0, 0),
-      Some(PopupPosition::Logical { x, y }) => (1, x, y, 0),
-      Some(PopupPosition::Physical { x, y }) => (1, x, y, 1),
+      Some(PopupPosition::Logical { x, y }) if usable(x, y) => (1, x, y, 0),
+      Some(PopupPosition::Physical { x, y }) if usable(x, y) => (1, x, y, 1),
+      // Non-finite or absurd coordinates (Qt converts them to `int`) show it at the cursor.
+      _ => (0, 0.0, 0.0, 0),
     };
     unsafe { sys::qs_popup_menu_show(menu.as_ptr(), parent.as_ptr(), has_pos, x, y, physical) }
   }
+}
+
+/// Whether a popup position can be converted to Qt's `int` coordinates (also after scaling).
+fn usable(x: f64, y: f64) -> bool {
+  const LIMIT: f64 = 1e7;
+  x.is_finite() && y.is_finite() && x.abs() <= LIMIT && y.abs() <= LIMIT
 }
 
 impl sealed::Sealed for PopupMenu {}
@@ -488,5 +498,120 @@ pub mod debug {
   pub fn take_popup_menu() -> String {
     lifecycle::ensure();
     unsafe { take_cstring(sys::qs_debug_take_popup()) }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  //! Pure logic only: no `QApplication` here (see `tests/qt/menu.rs` for that).
+
+  use super::*;
+
+  fn icon(rgba: &[u8], width: u32, height: u32) -> (*const u8, c_int, c_int) {
+    Icon::raw(Some(&Icon {
+      rgba,
+      width,
+      height,
+    }))
+  }
+
+  #[test]
+  fn icon_raw_none_is_null() {
+    assert_eq!(Icon::raw(None), (std::ptr::null(), 0, 0));
+  }
+
+  #[test]
+  fn icon_raw_exact_buffer() {
+    let px = [0u8; 2 * 3 * 4];
+    assert_eq!(icon(&px, 2, 3), (px.as_ptr(), 2, 3));
+  }
+
+  #[test]
+  fn icon_raw_larger_buffer() {
+    let px = [0u8; 100];
+    assert_eq!(icon(&px, 2, 2), (px.as_ptr(), 2, 2));
+  }
+
+  #[test]
+  fn icon_raw_too_small_buffer_is_null() {
+    let px = [0u8; 2 * 3 * 4 - 1];
+    assert_eq!(icon(&px, 2, 3), (std::ptr::null(), 0, 0));
+    assert_eq!(icon(&[], 1, 1), (std::ptr::null(), 0, 0));
+  }
+
+  #[test]
+  fn icon_raw_zero_size_is_no_icon() {
+    assert_eq!(icon(&[], 0, 0), (std::ptr::null(), 0, 0));
+    assert_eq!(icon(&[], 0, 1 << 20), (std::ptr::null(), 0, 0));
+  }
+
+  #[test]
+  fn icon_raw_size_beyond_c_int() {
+    // `width as c_int` wraps to a negative number, which the C++ side ignores.
+    let (_, w, h) = icon(&[], u32::MAX, 0);
+    assert!(w <= 0, "{w}");
+    assert_eq!(h, 0);
+  }
+
+  #[test]
+  fn icon_raw_huge_size_does_not_panic() {
+    assert_eq!(icon(&[], u32::MAX, u32::MAX), (std::ptr::null(), 0, 0));
+  }
+
+  #[test]
+  fn action_options_default() {
+    let o = ActionOptions::default();
+    assert_eq!(o.text, "");
+    assert!(o.enabled);
+    assert!(!o.checkable);
+    assert!(!o.checked);
+    assert!(o.shortcut.is_none());
+    assert!(o.shortcut_hint.is_none());
+    assert!(o.icon.is_none());
+  }
+
+  #[test]
+  fn standard_action_is_editing() {
+    use StandardAction::*;
+    for a in [Copy, Cut, Paste, SelectAll, Undo, Redo, Delete] {
+      assert!(a.is_editing(), "{a:?}");
+    }
+    for a in [Minimize, Maximize, Fullscreen, Hide, CloseWindow, Quit] {
+      assert!(!a.is_editing(), "{a:?}");
+    }
+  }
+
+  #[test]
+  fn popup_position_eq() {
+    let l = PopupPosition::Logical { x: 1.0, y: 2.0 };
+    let p = PopupPosition::Physical { x: 1.0, y: 2.0 };
+    assert_eq!(l, l);
+    assert_ne!(l, p);
+  }
+
+  // Every entry point checks that Qt is running on this thread.
+
+  #[test]
+  #[should_panic(expected = "Qt can only be used on the thread")]
+  fn standard_action_without_app_panics() {
+    StandardAction::Copy.trigger();
+  }
+
+  #[test]
+  #[should_panic(expected = "Qt can only be used on the thread")]
+  fn show_about_without_app_panics() {
+    show_about("t", "h", None);
+  }
+
+  #[test]
+  #[should_panic(expected = "Qt can only be used on the thread")]
+  fn take_popup_menu_without_app_panics() {
+    debug::take_popup_menu();
+  }
+
+  #[test]
+  #[should_panic(expected = "Qt can only be used on the thread")]
+  fn from_ptr_null_without_app_panics() {
+    Widget::from_ptr(std::ptr::null_mut());
   }
 }

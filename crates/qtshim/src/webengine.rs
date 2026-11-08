@@ -520,10 +520,9 @@ impl Window {
   /// small).
   pub fn set_icon(&self, rgba: &[u8], width: u32, height: u32) {
     crate::lifecycle::ensure();
-    if rgba.len() < (width * height * 4) as usize {
-      return;
+    if let Some((w, h)) = crate::util::rgba_dims(rgba.len(), width, height) {
+      unsafe { sys::qs_window_set_icon(self.p(), rgba.as_ptr(), w, h) }
     }
-    unsafe { sys::qs_window_set_icon(self.p(), rgba.as_ptr(), width as i32, height as i32) }
   }
   /// Set the window's background color (`(r, g, b, a)`), or reset it with `None`.
   pub fn set_background(&self, color: Option<(u8, u8, u8, u8)>) {
@@ -872,9 +871,96 @@ impl Drop for View {
 
 #[cfg(test)]
 mod tests {
+  use super::{SchemeFlags, headers_string, parse_content_range};
+
   #[test]
   fn content_range() {
-    assert_eq!(super::parse_content_range("bytes 2-4/10"), Some((2, 10)));
-    assert_eq!(super::parse_content_range("bytes 0-0/*"), None);
+    assert_eq!(parse_content_range("bytes 2-4/10"), Some((2, 10)));
+    assert_eq!(parse_content_range("bytes 0-0/*"), None);
+  }
+
+  #[test]
+  fn content_range_whitespace_and_shapes() {
+    assert_eq!(parse_content_range("  bytes 0-99/100 "), Some((0, 100)));
+    assert_eq!(parse_content_range("bytes  5 - 9 / 20"), Some((5, 20)));
+    assert_eq!(parse_content_range("bytes=5-9/20"), None);
+    assert_eq!(parse_content_range("bytes 7-/20"), Some((7, 20)));
+    assert_eq!(
+      parse_content_range("bytes 0-1/9000000000"),
+      Some((0, 9_000_000_000))
+    );
+  }
+
+  #[test]
+  fn content_range_rejects_malformed() {
+    for v in [
+      "",
+      "bytes",
+      "items 0-1/2",
+      "bytes 0-1",
+      "bytes */100",
+      "bytes a-1/2",
+      "bytes 0-1/x",
+      "bytes -1-2/3",
+    ] {
+      assert_eq!(parse_content_range(v), None, "{v:?}");
+    }
+  }
+
+  #[test]
+  fn headers_string_formats_one_line_per_value() {
+    let mut h = http::HeaderMap::new();
+    h.insert("x-one", "1".parse().unwrap());
+    h.append("x-multi", "a".parse().unwrap());
+    h.append("x-multi", "b".parse().unwrap());
+    let s = headers_string(&h, false);
+    let mut lines: Vec<_> = s.lines().collect();
+    lines.sort_unstable();
+    assert_eq!(lines, ["x-multi: a", "x-multi: b", "x-one: 1"]);
+    assert!(s.ends_with('\n'));
+    assert_eq!(headers_string(&http::HeaderMap::new(), false), "");
+  }
+
+  #[test]
+  fn headers_string_skips_content_type_on_request() {
+    let mut h = http::HeaderMap::new();
+    h.insert(http::header::CONTENT_TYPE, "text/html".parse().unwrap());
+    h.insert("x-a", "1".parse().unwrap());
+    assert_eq!(headers_string(&h, true), "x-a: 1\n");
+    assert!(headers_string(&h, false).contains("content-type: text/html\n"));
+  }
+
+  #[test]
+  fn headers_string_skips_non_utf8_values() {
+    let mut h = http::HeaderMap::new();
+    h.insert("x-bin", http::HeaderValue::from_bytes(b"caf\xe9").unwrap());
+    h.insert("x-ok", "fine".parse().unwrap());
+    assert_eq!(headers_string(&h, false), "x-ok: fine\n");
+  }
+
+  #[test]
+  fn scheme_flag_bits() {
+    assert_eq!(SchemeFlags::default().bits(), 0);
+    assert_eq!(SchemeFlags::APP.bits(), 0b1111);
+    let all = SchemeFlags {
+      secure: true,
+      cors: true,
+      fetch_api: true,
+      local_access: true,
+      service_workers: true,
+      csp_bypass: true,
+    };
+    assert_eq!(all.bits(), 0b11_1111);
+    let one = |f: fn(&mut SchemeFlags)| {
+      let mut flags = SchemeFlags::default();
+      f(&mut flags);
+      flags.bits()
+    };
+    assert_eq!(one(|f| f.secure = true), 1);
+    assert_eq!(one(|f| f.cors = true), 2);
+    assert_eq!(one(|f| f.fetch_api = true), 4);
+    assert_eq!(one(|f| f.local_access = true), 8);
+    assert_eq!(one(|f| f.service_workers = true), 16);
+    assert_eq!(one(|f| f.csp_bypass = true), 32);
   }
 }

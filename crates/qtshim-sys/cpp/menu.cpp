@@ -131,7 +131,7 @@ void qs_menubar_set_visible(void *widget, int visible) {
 
 int qs_menubar_is_visible(void *widget) {
   QMenuBar *bar = findMenuBar(static_cast<QWidget *>(widget));
-  return bar && bar->isVisible() ? 1 : 0;
+  return bar && !bar->isHidden() ? 1 : 0; // its own flag, even while the window is hidden
 }
 
 // Remove (and schedule deletion of) everything in a menubar or menu.
@@ -189,7 +189,10 @@ void qs_container_add_action(void *container, const char *text, int enabled, int
   if (!icon.isNull())
     action->setIcon(icon);
   if (on_click)
-    QObject::connect(action, &QAction::triggered, action, [on_click, ud] { on_click(ud); });
+    QObject::connect(action, &QAction::triggered, action, [on_click, ud] {
+      qs::CallbackScope scope; // the callback may destroy this action (e.g. by closing its window)
+      on_click(ud);
+    });
   if (drop)
     QObject::connect(action, &QObject::destroyed, [drop, ud] { drop(ud); });
   c->addAction(action);

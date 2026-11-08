@@ -1,0 +1,11 @@
+[package]
+name = "qt-test-harness"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0 OR MIT"
+description = "Runs each Qt test case in its own process, on the main thread (for harness = false tests)"
+publish = false
+
+[dependencies]
+libtest-mimic = "0.8"

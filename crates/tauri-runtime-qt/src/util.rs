@@ -153,4 +153,133 @@ mod tests {
     assert!(!path_matches("/ab", "/a"));
     assert!(path_matches("/anything", "/"));
   }
+
+  #[test]
+  fn cookie_matching_edge_cases() {
+    // Case-insensitive, and a leading dot is ignored.
+    assert!(domain_matches("API.Example.COM", "example.com"));
+    assert!(domain_matches("example.com", ".EXAMPLE.com"));
+    // A parent domain doesn't match a subdomain cookie.
+    assert!(!domain_matches("example.com", "api.example.com"));
+    assert!(path_matches("/a/b", "/a/"));
+    assert!(path_matches("/a", "/a"));
+    assert!(path_matches("/x", ""));
+    assert!(!path_matches("/", "/a"));
+    assert!(!path_matches("/b/a", "/a"));
+  }
+
+  #[test]
+  fn conversions_round_to_whole_pixels() {
+    assert_eq!(round(1.5), 2);
+    assert_eq!(round(-1.4), -1);
+    assert_eq!(
+      size_to_logical(Size::Physical(PhysicalSize::new(300, 201)), 2.0),
+      (150, 101)
+    );
+    assert_eq!(
+      size_to_logical(Size::Logical(LogicalSize::new(10.4, 10.6)), 3.0),
+      (10, 11)
+    );
+    assert_eq!(
+      position_to_logical(Position::Physical(PhysicalPosition::new(-30, 45)), 1.5),
+      (-20, 30)
+    );
+    assert_eq!(
+      position_to_logical(Position::Logical(LogicalPosition::new(7.0, 8.0)), 2.0),
+      (7, 8)
+    );
+    assert_eq!(unit_to_logical(PixelUnit::Logical(12.5.into()), 2.0), 12.5);
+    assert_eq!(unit_to_logical(PixelUnit::Physical(30.into()), 2.0), 15.0);
+    assert_eq!(physical_size(100, 50, 1.25), PhysicalSize::new(125, 63));
+    // Negative sizes clamp to zero.
+    assert_eq!(physical_size(-5, 10, 1.0), PhysicalSize::new(0, 10));
+    assert_eq!(
+      physical_position(-10, 3, 2.0),
+      PhysicalPosition::new(-20, 6)
+    );
+  }
+
+  #[test]
+  fn monitor_from_screen_scales_to_physical() {
+    let screen = Screen {
+      name: "DP-1".into(),
+      x: 100,
+      y: 0,
+      width: 1280,
+      height: 720,
+      available_x: 100,
+      available_y: 30,
+      available_width: 1280,
+      available_height: 690,
+      scale: 2.0,
+      primary: true,
+    };
+    let m = monitor_from_screen(&screen);
+    assert_eq!(m.name.as_deref(), Some("DP-1"));
+    assert_eq!(m.size, PhysicalSize::new(2560, 1440));
+    assert_eq!(m.position, PhysicalPosition::new(200, 0));
+    assert_eq!(m.work_area.position, PhysicalPosition::new(200, 60));
+    assert_eq!(m.work_area.size, PhysicalSize::new(2560, 1380));
+    assert_eq!(m.scale_factor, 2.0);
+  }
+
+  #[test]
+  fn cursor_shapes_map_to_qt() {
+    use CursorIcon::*;
+    let cases = [
+      (Default, 0),
+      (Arrow, 0),
+      (Crosshair, 2),
+      (Wait, 3),
+      (Text, 4),
+      (VerticalText, 4),
+      (NsResize, 5),
+      (RowResize, 5),
+      (EwResize, 6),
+      (ColResize, 6),
+      (NeswResize, 7),
+      (NwseResize, 8),
+      (Move, 9),
+      (AllScroll, 9),
+      (Hand, 13),
+      (NotAllowed, 14),
+      (NoDrop, 14),
+      (Help, 15),
+      (ContextMenu, 15),
+      (Progress, 16),
+      (Grab, 17),
+      (Grabbing, 18),
+      (Copy, 19),
+      (Alias, 21),
+      (Cell, 2),
+      (ZoomIn, 2),
+      (ZoomOut, 2),
+    ];
+    for (icon, shape) in cases {
+      assert_eq!(cursor_shape(icon), shape, "{icon:?}");
+    }
+  }
+
+  #[test]
+  fn resize_directions_map_to_qt_edges() {
+    use ResizeDirection::*;
+    assert_eq!(resize_edges(North), 1);
+    assert_eq!(resize_edges(West), 2);
+    assert_eq!(resize_edges(East), 4);
+    assert_eq!(resize_edges(South), 8);
+    assert_eq!(resize_edges(NorthEast), 1 | 4);
+    assert_eq!(resize_edges(NorthWest), 1 | 2);
+    assert_eq!(resize_edges(SouthEast), 8 | 4);
+    assert_eq!(resize_edges(SouthWest), 8 | 2);
+  }
+
+  #[test]
+  fn unsupported_names_the_api() {
+    let e = unsupported("gtk_window");
+    assert!(
+      e.to_string()
+        .contains("`gtk_window` is not available with the Qt runtime"),
+      "{e}"
+    );
+  }
 }

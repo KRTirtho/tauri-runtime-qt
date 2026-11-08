@@ -6,6 +6,7 @@
 #include <QByteArray>
 #include <QCoreApplication>
 #include <QMetaObject>
+#include <QPointer>
 #include <QThread>
 
 #include <cmath>
@@ -41,6 +42,38 @@ template <typename F> void runOnMain(F &&f) {
 
 inline bool inEventLoop() { return QThread::currentThread()->loopLevel() > 0; }
 
+// How many calls from C++ into Rust are on the stack (see CallbackScope).
+extern int g_callbackDepth;
+
+// Marks a call into Rust (an event, a menu action, a scheme request, a closure). Rust may destroy
+// any object meanwhile, including the one whose signal or virtual function is running.
+struct CallbackScope {
+  CallbackScope() { ++g_callbackDepth; }
+  ~CallbackScope() { --g_callbackDepth; }
+  CallbackScope(const CallbackScope &) = delete;
+  CallbackScope &operator=(const CallbackScope &) = delete;
+};
+
+// Whether a Qt object may be deleted right away. Not inside the event loop (deleteLater is
+// processed there) and not inside a call into Rust: the object may be the sender of the signal
+// being handled, or be used by the C++ frames below. Otherwise deleteLater; outside any event
+// loop such objects are deleted at the next event loop run or at qs_app_shutdown.
+inline bool canDeleteNow() { return !inEventLoop() && g_callbackDepth == 0; }
+
+// Delete `o` now if canDeleteNow(), else as soon as possible: deleteLater inside the event loop;
+// outside it (e.g. with only qs_app_process_events) a queued call, which processEvents runs.
+inline void deleteSoon(QObject *o) {
+  if (canDeleteNow()) {
+    delete o;
+  } else if (inEventLoop()) {
+    o->deleteLater();
+  } else {
+    QPointer<QObject> p(o);
+    QMetaObject::invokeMethod(
+        QCoreApplication::instance(), [p] { if (p) deleteSoon(p.data()); }, Qt::QueuedConnection);
+  }
+}
+
 // Builder for an outgoing event; keeps the string payloads alive for the call.
 struct Ev {
   QsEvent e{};
@@ -58,6 +91,7 @@ struct Ev {
     e.s2 = s2.constData();
     e.s2_len = static_cast<size_t>(s2.size());
     QsReply tmp;
+    CallbackScope scope;
     return g_event_fn(g_event_ud, &e, reply ? reply : &tmp);
   }
 };

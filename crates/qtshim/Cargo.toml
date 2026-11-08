@@ -20,3 +20,13 @@ http = { version = "1", optional = true }
 
 [package.metadata.docs.rs]
 all-features = true
+
+[dev-dependencies]
+qt-test-harness = { path = "../qt-test-harness" }
+
+# Real Qt tests, one process per case (see `qt-test-harness`).
+[[test]]
+name = "qt"
+path = "tests/qt/main.rs"
+harness = false
+required-features = ["webengine"]

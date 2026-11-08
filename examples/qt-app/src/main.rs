@@ -91,9 +91,125 @@ fn ping_event(app: AppHandle) {
   app.emit("from-rust", "pong").unwrap();
 }
 
+/// Print a check result. `skipped` checks can't run on this platform (e.g. WebGL offscreen);
+/// `bug` marks a check for a known bug that isn't run (see `known_bugs`).
 #[tauri::command]
-fn report(name: String, ok: bool, detail: String) {
-  println!("[{}] {name}: {detail}", if ok { "PASS" } else { "FAIL" });
+fn report(name: String, ok: bool, detail: String, skipped: Option<bool>, bug: Option<bool>) {
+  let status = match (bug.unwrap_or(false), skipped.unwrap_or(false), ok) {
+    (true, ..) => "KNOWN-BUG",
+    (_, true, _) => "SKIP",
+    (_, _, true) => "PASS",
+    _ => "FAIL",
+  };
+  println!("[{status}] {name}: {detail}");
+}
+
+/// `QT_APP_BUGS=1` also runs the checks for known bugs (some of them hang the app).
+#[tauri::command]
+fn known_bugs() -> bool {
+  std::env::var_os("QT_APP_BUGS").is_some_and(|v| v != "0")
+}
+
+/// Every webview with the label of the window it is in. (`getAllWebviews()` in the JS API
+/// can't be used for this: tauri's `WebviewRef` serializes `window_label`, but the JS reads
+/// `windowLabel`.)
+#[tauri::command]
+fn webview_hosts(app: AppHandle) -> std::collections::BTreeMap<String, String> {
+  app
+    .webviews()
+    .into_iter()
+    .map(|(label, webview)| (label, webview.window().label().to_string()))
+    .collect()
+}
+
+/// The Qt platform plugin the app runs on (`offscreen`, `wayland`, `xcb`), from the environment
+/// Qt reads it from.
+#[tauri::command]
+fn qpa_platform() -> String {
+  match std::env::var("QT_QPA_PLATFORM") {
+    Ok(p) if !p.is_empty() => p.split([';', ':']).next().unwrap_or_default().to_string(),
+    _ if std::env::var_os("WAYLAND_DISPLAY").is_some() => "wayland".into(),
+    _ => "xcb".into(),
+  }
+}
+
+/// How many times `on_web_content_process_terminate` fired.
+static TERMINATIONS: AtomicU32 = AtomicU32::new(0);
+
+#[tauri::command]
+fn terminations() -> u32 {
+  TERMINATIONS.load(Ordering::Relaxed)
+}
+
+/// Raw IPC: echo a binary request body back reversed, as a raw response.
+#[tauri::command]
+fn reverse_bytes(request: tauri::ipc::Request<'_>) -> Result<tauri::ipc::Response, String> {
+  match request.body() {
+    tauri::ipc::InvokeBody::Raw(bytes) => Ok(tauri::ipc::Response::new(
+      bytes.iter().rev().copied().collect::<Vec<u8>>(),
+    )),
+    tauri::ipc::InvokeBody::Json(v) => Err(format!("expected a raw body, got JSON {v}")),
+  }
+}
+
+/// The request headers the IPC request carried (to check custom `invoke` headers arrive).
+#[tauri::command]
+fn ipc_header(request: tauri::ipc::Request<'_>, name: String) -> Option<String> {
+  request
+    .headers()
+    .get(&name)
+    .and_then(|v| v.to_str().ok())
+    .map(str::to_string)
+}
+
+/// A large JSON response: `len` characters.
+#[tauri::command]
+fn big_string(len: usize) -> String {
+  "0123456789".chars().cycle().take(len).collect()
+}
+
+/// Sum of the bytes of a (JSON-encoded) array argument, and the length of a string argument.
+#[tauri::command]
+fn measure(bytes: Vec<u8>, text: String) -> (u64, usize) {
+  (bytes.iter().map(|&b| b as u64).sum(), text.chars().count())
+}
+
+/// Stream `count` numbers through a channel from another thread, then `chunks` raw chunks.
+#[tauri::command]
+fn stream_numbers(
+  count: u32,
+  numbers: tauri::ipc::Channel<u32>,
+  raw: tauri::ipc::Channel<tauri::ipc::Response>,
+) {
+  std::thread::spawn(move || {
+    for i in 0..count {
+      numbers.send(i).unwrap();
+    }
+    for i in 0..4u8 {
+      raw
+        .send(tauri::ipc::Response::new(vec![i; 64 * 1024]))
+        .unwrap();
+    }
+  });
+}
+
+/// `Emitter::emit_to` from Rust to a specific webview label.
+#[tauri::command]
+fn emit_to(
+  app: AppHandle,
+  target: String,
+  event: String,
+  payload: serde_json::Value,
+) -> Result<(), String> {
+  app
+    .emit_to(target.as_str(), &event, payload)
+    .map_err(|e| e.to_string())
+}
+
+/// `QT_APP_ONLY`: a regex selecting which self-test checks run (a development aid).
+#[tauri::command]
+fn selftest_only() -> Option<String> {
+  std::env::var("QT_APP_ONLY").ok()
 }
 
 #[tauri::command]
@@ -106,7 +222,7 @@ fn done(app: AppHandle, failures: u32) {
   println!("self-test finished with {failures} failure(s)");
   match std::env::var("QT_APP_AUTO").as_deref() {
     // Close the last window: the runtime must emit ExitRequested and quit on its own.
-    Ok("close") => app.get_webview_window("main").unwrap().close().unwrap(),
+    Ok("close") if failures == 0 => app.get_webview_window("main").unwrap().close().unwrap(),
     Ok(_) => app.exit(if failures == 0 { 0 } else { 1 }),
     Err(_) => {}
   }
@@ -343,26 +459,45 @@ fn open_window(app: AppHandle, with_parent: bool) -> Result<String, String> {
 // --- custom protocol --------------------------------------------------------------------------
 
 /// A custom protocol that supports byte ranges, like Tauri's asset protocol does for video.
+/// `/tone.wav` is a 3 s WAV file (for `<audio>` seeking); anything else is 1000 bytes of text.
 fn stream_protocol(
   _ctx: tauri::UriSchemeContext<'_, R>,
   request: tauri::http::Request<Vec<u8>>,
 ) -> tauri::http::Response<Cow<'static, [u8]>> {
+  if request.uri().path() == "/tone.wav" {
+    return ranged(&request, "audio/wav", wav(3));
+  }
   let body: Vec<u8> = (0..1000u32)
     .map(|i| b"0123456789abcdefghijklmnopqrstuvwxyz"[(i % 36) as usize])
     .collect();
+  ranged(&request, "text/plain", body)
+}
+
+/// Parse a single `Range: bytes=` header against a body of `len` bytes (inclusive bounds).
+fn parse_range(header: Option<&str>, len: usize) -> Option<(usize, usize)> {
+  let (a, b) = header?.strip_prefix("bytes=")?.split_once('-')?;
+  let (start, end) = match (a.parse::<usize>().ok(), b.parse::<usize>().ok()) {
+    (Some(a), Some(b)) => (a, b.min(len - 1)),
+    (Some(a), None) => (a, len - 1),
+    (None, Some(n)) => (len.saturating_sub(n), len - 1),
+    (None, None) => return None,
+  };
+  (start <= end && end < len).then_some((start, end))
+}
+
+/// Serve `body` honouring a byte range, like Tauri's asset protocol.
+fn ranged(
+  request: &tauri::http::Request<Vec<u8>>,
+  content_type: &str,
+  body: Vec<u8>,
+) -> tauri::http::Response<Cow<'static, [u8]>> {
   let builder = tauri::http::Response::builder()
     .header("Access-Control-Allow-Origin", "*")
-    .header("Content-Type", "text/plain")
+    .header("Content-Type", content_type)
     .header("Accept-Ranges", "bytes");
-  let range = request
-    .headers()
-    .get("range")
-    .and_then(|v| v.to_str().ok())
-    .and_then(|v| v.strip_prefix("bytes="))
-    .and_then(|v| v.split_once('-'))
-    .and_then(|(a, b)| Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok()?)));
-  match range {
-    Some((start, end)) if start <= end && end < body.len() => builder
+  let range = request.headers().get("range").and_then(|v| v.to_str().ok());
+  match parse_range(range, body.len()) {
+    Some((start, end)) => builder
       .status(206)
       .header(
         "Content-Range",
@@ -370,8 +505,90 @@ fn stream_protocol(
       )
       .body(Cow::Owned(body[start..=end].to_vec()))
       .unwrap(),
-    _ => builder.body(Cow::Owned(body)).unwrap(),
+    None => builder.body(Cow::Owned(body)).unwrap(),
   }
+}
+
+/// A mono 16-bit PCM WAV file of `seconds` seconds (a 440 Hz tone), to test media seeking.
+fn wav(seconds: u32) -> Vec<u8> {
+  const RATE: u32 = 8000;
+  let samples = RATE * seconds;
+  let mut out = Vec::with_capacity(44 + samples as usize * 2);
+  let data_len = samples * 2;
+  out.extend_from_slice(b"RIFF");
+  out.extend_from_slice(&(36 + data_len).to_le_bytes());
+  out.extend_from_slice(b"WAVEfmt ");
+  out.extend_from_slice(&16u32.to_le_bytes());
+  out.extend_from_slice(&1u16.to_le_bytes()); // PCM
+  out.extend_from_slice(&1u16.to_le_bytes()); // mono
+  out.extend_from_slice(&RATE.to_le_bytes());
+  out.extend_from_slice(&(RATE * 2).to_le_bytes());
+  out.extend_from_slice(&2u16.to_le_bytes());
+  out.extend_from_slice(&16u16.to_le_bytes());
+  out.extend_from_slice(b"data");
+  out.extend_from_slice(&data_len.to_le_bytes());
+  for i in 0..samples {
+    let v = ((i as f32 * 440.0 * std::f32::consts::TAU / RATE as f32).sin() * 8000.0) as i16;
+    out.extend_from_slice(&v.to_le_bytes());
+  }
+  out
+}
+
+/// A custom protocol answering from another thread (`register_asynchronous_uri_scheme_protocol`):
+/// - `/echo`: JSON with the method, body length/checksum and the `x-test` header
+/// - `/bytes?n=N`: N bytes, byte i = i % 251
+/// - `/redirect`: a 302 to `/echo`
+/// - `/missing`: an empty 404
+fn async_protocol(
+  _ctx: tauri::UriSchemeContext<'_, R>,
+  request: tauri::http::Request<Vec<u8>>,
+  responder: tauri::UriSchemeResponder,
+) {
+  std::thread::spawn(move || {
+    let uri = request.uri().clone();
+    let builder = tauri::http::Response::builder().header("Access-Control-Allow-Origin", "*");
+    let response = match uri.path() {
+      "/echo" => {
+        let body = request.body();
+        let sum: u64 = body.iter().map(|&b| b as u64).sum();
+        let header = request
+          .headers()
+          .get("x-test")
+          .and_then(|v| v.to_str().ok())
+          .unwrap_or_default();
+        let json = json!({
+          "method": request.method().as_str(),
+          "len": body.len(),
+          "sum": sum,
+          "header": header,
+          "query": uri.query().unwrap_or_default(),
+        });
+        builder
+          .header("Content-Type", "application/json")
+          .header("X-Reply", "from-rust")
+          .body(json.to_string().into_bytes())
+          .unwrap()
+      }
+      "/bytes" => {
+        let n = uri
+          .query()
+          .and_then(|q| q.strip_prefix("n="))
+          .and_then(|n| n.parse::<usize>().ok())
+          .unwrap_or(0);
+        builder
+          .header("Content-Type", "application/octet-stream")
+          .body((0..n).map(|i| (i % 251) as u8).collect())
+          .unwrap()
+      }
+      "/redirect" => builder
+        .status(302)
+        .header("Location", "async://localhost/echo?redirected=1")
+        .body(Vec::new())
+        .unwrap(),
+      _ => builder.status(404).body(Vec::new()).unwrap(),
+    };
+    responder.respond(response);
+  });
 }
 
 // --- menus ------------------------------------------------------------------------------------
@@ -639,6 +856,7 @@ fn main() {
     .runtime(tauri_runtime_qt::Qt::default())
     .manage(Showcase::default())
     .register_uri_scheme_protocol("stream", stream_protocol)
+    .register_asynchronous_uri_scheme_protocol("async", async_protocol)
     .invoke_handler(tauri::generate_handler![
       greet,
       slow_add,
@@ -649,7 +867,18 @@ fn main() {
       go_back,
       ping_event,
       report,
+      qpa_platform,
+      terminations,
+      reverse_bytes,
+      ipc_header,
+      big_string,
+      measure,
+      stream_numbers,
+      emit_to,
       auto_mode,
+      selftest_only,
+      known_bugs,
+      webview_hosts,
       done,
       menu_tree,
       menu_trigger,
@@ -707,6 +936,7 @@ fn main() {
           webview.label()
         ),
       );
+      TERMINATIONS.fetch_add(1, Ordering::Relaxed);
       let _ = webview.reload();
     })
     .setup(|app| {
@@ -721,9 +951,32 @@ fn main() {
     })
     .build(tauri::generate_context!())
     .expect("error while building tauri application")
-    .run(|_app, event| match event {
-      tauri::RunEvent::ExitRequested { code, .. } => {
-        println!("[run] exit requested (code {code:?})")
+    .run(|app, event| match event {
+      tauri::RunEvent::ExitRequested { code, api, .. } => {
+        println!("[run] exit requested (code {code:?})");
+        // QT_APP_AUTO=close: the last window closed. Prevent that exit once, then exit
+        // explicitly from another thread, which must still reach the (running) event loop.
+        static PREVENTED: AtomicBool = AtomicBool::new(false);
+        let close_mode = std::env::var("QT_APP_AUTO").as_deref() == Ok("close");
+        if close_mode && code.is_none() && !PREVENTED.swap(true, Ordering::Relaxed) {
+          api.prevent_exit();
+          let windows = app.webview_windows().len();
+          println!(
+            "[{}] exit: ExitRequested(None) after the last window closed, prevented ({windows} windows left)",
+            if windows == 0 { "PASS" } else { "FAIL" }
+          );
+          let app = app.clone();
+          std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            app.exit(0);
+          });
+        } else if close_mode {
+          let ok = code == Some(0) && PREVENTED.load(Ordering::Relaxed);
+          println!(
+            "[{}] exit: app.exit(0) from another thread after a prevented exit -> ExitRequested({code:?})",
+            if ok { "PASS" } else { "FAIL" }
+          );
+        }
       }
       tauri::RunEvent::Exit => println!("[run] exit"),
       _ => {}
