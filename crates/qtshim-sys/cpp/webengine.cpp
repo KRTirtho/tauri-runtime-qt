@@ -148,6 +148,42 @@ private:
   qint64 m_start, m_total;
 };
 
+// QWebEngineUrlRequestJob::setAdditionalResponseHeaders (Qt 6.11) lowercases header *values*,
+// which breaks case-sensitive ones. The one that matters is Content-Security-Policy: its hash
+// sources ('sha256-<base64>') stop matching, so e.g. Tauri's isolation iframe can't run its
+// script and every IPC call hangs. For HTML documents the policy is delivered as
+// <meta http-equiv="Content-Security-Policy"> tags at the start of <head> instead, which browsers
+// enforce the same way (except frame-ancestors, report-uri and sandbox, which only work as
+// headers).
+QByteArray injectCsp(const QByteArray &html, const QList<QByteArray> &policies) {
+  QByteArray metas;
+  for (QByteArray p : policies) {
+    p.replace('&', "&amp;").replace('"', "&quot;").replace('<', "&lt;");
+    metas += "<meta http-equiv=\"Content-Security-Policy\" content=\"" + p + "\">";
+  }
+  // After the opening <head ...> tag, else after <html ...>, else at the very start.
+  const QByteArray lower = html.left(64 * 1024).toLower();
+  for (const char *tag : {"<head", "<html"}) {
+    qsizetype i = lower.indexOf(tag);
+    // Not e.g. <header>: the tag name must end here.
+    while (i >= 0) {
+      const char next = lower.size() > i + qsizetype(qstrlen(tag)) ? lower.at(i + qstrlen(tag)) : '\0';
+      if (next == '>' || next == ' ' || next == '\t' || next == '\n' || next == '\r' || next == '/')
+        break;
+      i = lower.indexOf(tag, i + 1);
+    }
+    if (i < 0)
+      continue;
+    const qsizetype end = lower.indexOf('>', i);
+    if (end < 0)
+      break;
+    QByteArray out = html;
+    out.insert(end + 1, metas);
+    return out;
+  }
+  return metas + html;
+}
+
 // The largest request body a scheme handler receives; larger requests fail.
 constexpr qint64 kMaxRequestBody = qint64(256) << 20;
 
@@ -1444,6 +1480,9 @@ void qs_job_respond(QsJob *jobPtr, int status, const char *content_type, const c
       return; // request was cancelled
     QMultiMap<QByteArray, QByteArray> extra;
     QByteArray location;
+    // Only whole HTML documents can carry their policy in a <meta> tag (see injectCsp).
+    const bool html = status != 206 && ct.trimmed().toLower().startsWith("text/html");
+    QList<QByteArray> csp;
     for (const QByteArray &line : hdr.split('\n')) {
       const int colon = line.indexOf(':');
       if (colon <= 0)
@@ -1455,6 +1494,10 @@ void qs_job_respond(QsJob *jobPtr, int status, const char *content_type, const c
       // Qt computes these itself from the device.
       if (lk == "content-length" || lk == "content-range" || lk == "content-type")
         continue;
+      if (lk == "content-security-policy" && html) {
+        csp << val; // see injectCsp
+        continue;
+      }
       extra.insert(extra.cend(), k, val); // after earlier values of the same key: keep their order
     }
     if (status >= 300 && status < 400 && !location.isEmpty()) {
@@ -1470,6 +1513,8 @@ void qs_job_respond(QsJob *jobPtr, int status, const char *content_type, const c
     }
     if (!extra.isEmpty())
       job->setAdditionalResponseHeaders(extra);
+    if (!csp.isEmpty())
+      payload = injectCsp(payload, csp);
     QIODevice *dev;
     if (handle->suffix > 0 && status < 300) {
       // Qt (6.11) serves a `bytes=-N` request from the first N bytes of the device instead of
