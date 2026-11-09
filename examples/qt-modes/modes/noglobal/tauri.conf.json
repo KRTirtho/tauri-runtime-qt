@@ -1,0 +1,23 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "qt-modes",
+  "version": "0.1.0",
+  "identifier": "dev.example.qtmodes",
+  "build": {
+    "frontendDist": "../../dist"
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "windows": [],
+    "security": {
+      "csp": null,
+      "freezePrototype": false
+    }
+  },
+  "bundle": {
+    "active": false,
+    "icon": [
+      "../../icons/icon.png"
+    ]
+  }
+}

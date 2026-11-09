@@ -19,6 +19,8 @@ cargo test -p tauri-runtime-qt --lib                     # runtime unit tests
 cargo test -p tauri-runtime-qt --test qt                 # runtime driven through tauri_runtime traits
 cargo test -p qtshim-sys-systest --features webengine    # FFI decls vs qtshim.h (ctest + signature check)
 cargo test -p qt-app --test e2e                          # the four QT_APP_AUTO modes, offscreen
+cargo test -p qt-modes                                   # IPC checks under each Tauri mode (isolation, devUrl, postMessage fallback, remote ACL, ...)
+QT_MODES_MODE=isolation cargo run -p qt-modes            # one mode; modes: brownfield isolation devserver postmessage noglobal remote
 cargo llvm-cov -p qtshim --features webengine --summary-only   # coverage (child processes included)
 # muda's Qt backend (in ../muda):
 RUSTFLAGS="--cfg muda_qt_tests" cargo test --no-default-features --features qt --lib --test qt
