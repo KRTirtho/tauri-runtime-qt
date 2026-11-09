@@ -779,18 +779,26 @@ fn request_body_sizes() {
 
 fn csp_hash_case() {
   // sha256("document.title='hashed'"); Qt would lowercase it in a header.
-  const CSP: &str = "default-src 'self'; script-src 'sha256-8Q56ftgtlXxkQr5RiA6Pw+WlboQEeqNCt3JbdRNi/+I='";
+  const CSP: &str =
+    "default-src 'self'; script-src 'sha256-8Q56ftgtlXxkQr5RiA6Pw+WlboQEeqNCt3JbdRNi/+I='";
   start(|_, res| {
     res.respond(resp(
       200,
-      &[("Content-Type", "text/html; charset=utf-8"), ("Content-Security-Policy", CSP)],
+      &[
+        ("Content-Type", "text/html; charset=utf-8"),
+        ("Content-Security-Policy", CSP),
+      ],
       "<!doctype html><html><head><title>t</title></head><body>\
        <script>document.title='hashed'</script>\
        <script>document.title='not allowed'</script></body></html>",
     ))
   });
   let page = open(Profile::get(None, false), &[1], "app://host/csp");
-  wait_true(page.view(), "document.title === 'hashed'", "the hashed script to run");
+  wait_true(
+    page.view(),
+    "document.title === 'hashed'",
+    "the hashed script to run",
+  );
   // The policy is enforced: the second (unhashed) script didn't run.
   assert_eq!(eval(page.view(), "document.title"), "\"hashed\"");
   assert_eq!(
@@ -804,14 +812,18 @@ fn csp_hash_case() {
 
 fn response_header_case() {
   // Case-sensitive values, like CSP hashes ('sha256-<base64>').
-  const CSP: &str = "default-src 'self'; script-src 'sha256-EOd6N98xxmK5s7VvxV7W2w7YG+dmP52MqNiZUq1NLeE='";
+  const CSP: &str =
+    "default-src 'self'; script-src 'sha256-EOd6N98xxmK5s7VvxV7W2w7YG+dmP52MqNiZUq1NLeE='";
   start(|_, res| {
     res.respond(resp(
       200,
       &[
         ("Content-Type", "text/plain"),
         ("X-Mixed", "AbC-xYz"),
-        ("Access-Control-Expose-Headers", "X-Mixed, Content-Security-Policy"),
+        (
+          "Access-Control-Expose-Headers",
+          "X-Mixed, Content-Security-Policy",
+        ),
         ("Content-Security-Policy", CSP),
       ],
       "ok",

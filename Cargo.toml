@@ -8,6 +8,7 @@ members = [
   "crates/tauri-runtime-qt",
   "examples/qt-app",
   "examples/qt-modes",
+  "examples/qt-browser",
 ]
 
 # Qt menus need `tauri`'s `qt` feature and muda's Qt backend, which aren't released yet:

@@ -29,7 +29,7 @@ typedef void (*qs_str_fn)(void *ud, const char *s, size_t len);
 // events
 
 enum {
-  QS_EV_WINDOW_RESIZED = 1,    // a,b = physical inner w,h
+  QS_EV_WINDOW_RESIZED = 1,    // a,b = physical inner w,h (below a menubar; also sent when one is shown/hidden)
   QS_EV_WINDOW_MOVED = 2,      // a,b = physical outer x,y
   QS_EV_WINDOW_CLOSE_REQ = 3,  // user asked to close (the close is always blocked; Rust decides)
   QS_EV_WINDOW_FOCUS = 4,      // a = focused
@@ -204,6 +204,10 @@ int qs_window_native(QsWindow *w, int *kind, void **handle);
 void *qs_window_qwidget(QsWindow *w);
 // Logical size of the area holding the webviews (the window minus its menubar, if any).
 void qs_window_content_size(QsWindow *w, int32_t *width, int32_t *height);
+// Debugging: move the mouse (no buttons) to logical (x, y) in the window through Qt's input path,
+// like a real pointer, and return the shape of the application's override cursor (a
+// Qt::CursorShape), -1 if there's none, or -2 if unsupported (no QPA headers or no native window).
+int qs_debug_window_hover(QsWindow *w, int32_t x, int32_t y);
 // Make `w` transient for the window containing `parent` (any QWidget*).
 void qs_window_set_transient_for_widget(QsWindow *w, void *parent);
 

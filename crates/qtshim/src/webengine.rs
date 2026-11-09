@@ -588,6 +588,19 @@ impl Window {
     // SAFETY: the window is alive while `self` exists.
     unsafe { crate::menu::Widget::track(self.widget_ptr()) }
   }
+  /// Debugging: move the mouse to logical `(x, y)` in the window through Qt's input path, like a
+  /// real pointer, and return the application's override cursor shape (a `Qt::CursorShape`;
+  /// `None` without one). `Err(())` if the platform build can't inject input.
+  #[doc(hidden)]
+  #[allow(clippy::result_unit_err)]
+  pub fn debug_hover(&self, x: i32, y: i32) -> Result<Option<i32>, ()> {
+    crate::lifecycle::ensure();
+    match unsafe { sys::qs_debug_window_hover(self.p(), x, y) } {
+      -2 => Err(()),
+      -1 => Ok(None),
+      shape => Ok(Some(shape)),
+    }
+  }
   /// Logical size of the area holding the views (excludes a menubar).
   pub fn content_size(&self) -> (i32, i32) {
     crate::lifecycle::ensure();

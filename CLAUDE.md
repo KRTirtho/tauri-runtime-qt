@@ -21,6 +21,7 @@ cargo test -p qtshim-sys-systest --features webengine    # FFI decls vs qtshim.h
 cargo test -p qt-app --test e2e                          # the four QT_APP_AUTO modes, offscreen
 cargo test -p qt-modes                                   # IPC checks under each Tauri mode (isolation, devUrl, postMessage fallback, remote ACL, ...)
 QT_MODES_MODE=isolation cargo run -p qt-modes            # one mode; modes: brownfield isolation devserver postmessage noglobal remote
+cargo run -p qt-browser [url]                            # Chromium-style browser example: tabs, custom title bar, app menu, tray, plugins
 cargo llvm-cov -p qtshim --features webengine --summary-only   # coverage (child processes included)
 # muda's Qt backend (in ../muda):
 RUSTFLAGS="--cfg muda_qt_tests" cargo test --no-default-features --features qt --lib --test qt
@@ -86,6 +87,6 @@ The runtime has no GTK dependency and declares no `tauri_runtime::gtk` version; 
 
 ### Menus (`qt-menus` branch)
 - `tauri-runtime-qt` depends on `tauri` with `features = ["qt"]`. That feature selects muda's Qt backend (`muda/qt`) and adds `#[cfg(qt)]` branches next to `tauri`'s `#[cfg(gtk)]` menu code, calling `menu.init_for_qt_window(window.qt_window())`, `show_context_menu_for_qt_window`, etc. The window/app menu is attached in `WindowBuilder::build` right after the runtime returns the window (Qt has no `after_window_creation` path).
-- `QtWindowDispatcher::qt_window` returns the `QsWindow` (`QWidget*`). Each `QsWindow` has a `QVBoxLayout` with a `content` widget holding the webviews; muda puts its `QMenuBar` at the top via `QLayout::setMenuBar`. So view geometry and auto-resize are relative to `content` (`Window::content_size`), not the window.
+- `QtWindowDispatcher::qt_window` returns the `QsWindow` (`QWidget*`). Each `QsWindow` has a `QVBoxLayout` with a `content` widget holding the webviews; muda puts its `QMenuBar` at the top via `QLayout::setMenuBar`. So view geometry and auto-resize are relative to `content` (`Window::content_size`), not the window. Like a native client area, the window's *inner* size (geometry, `resize`, min/max, `WindowResized`) is that content area below a visible menubar; `WindowResized` also fires when the menubar is shown or hidden.
 - muda's Qt backend (`../muda/src/platform_impl/qt/`) has no C++ of its own: it depends on `qtshim` (path `../tauri-runtime-qt/crates/qtshim`) and uses `qtshim::menu`. It rebuilds every attached menubar from muda's item state on any change (coalesced, posted to the Qt loop), tracks windows with `QPointer`, and reuses `MenuItemAction` for clicks.
 - `tauri_runtime_qt::debug::{menubar_tree, trigger_menu_item, take_popup_menu}` inspect/drive the Qt menus; the example's self-test uses them. On Wayland a popup opened without user input can be dismissed by the compositor immediately, which is why `take_popup_menu` reports the last popup *shown*.

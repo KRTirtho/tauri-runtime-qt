@@ -61,6 +61,7 @@
 
 #ifdef QS_HAVE_QPA
 #include <qpa/qplatformnativeinterface.h>
+#include <qpa/qwindowsysteminterface.h>
 #endif
 
 #include <cmath>
@@ -359,14 +360,24 @@ struct QsWindow : public QWidget {
     content->installEventFilter(this);
   }
 
+  // Height of the menubar above `content` (0 without one, or while it's hidden). Sizes passed
+  // to and from Rust are of the area below it, like a native window's client area excludes its
+  // menu: that's where the webviews are laid out.
+  int barHeight() const {
+    QLayout *l = layout();
+    QWidget *bar = l ? l->menuBar() : nullptr;
+    return bar && !bar->isHidden() ? bar->sizeHint().height() : 0;
+  }
+
   void applySizeConstraints() {
     if (!resizable) {
       setFixedSize(size());
       return;
     }
-    setMinimumSize(qMax(0, minS.width()), qMax(0, minS.height()));
+    const int bar = barHeight();
+    setMinimumSize(qMax(0, minS.width()), qMax(0, minS.height()) + (minS.height() > 0 ? bar : 0));
     setMaximumSize(maxS.width() < 0 ? QWIDGETSIZE_MAX : maxS.width(),
-                   maxS.height() < 0 ? QWIDGETSIZE_MAX : maxS.height());
+                   maxS.height() < 0 ? QWIDGETSIZE_MAX : maxS.height() + bar);
   }
 
   void setFlagKeepVisible(Qt::WindowType f, bool on) {
@@ -406,18 +417,21 @@ struct QsWindow : public QWidget {
 
 protected:
   bool eventFilter(QObject *o, QEvent *e) override {
-    if (o == content && e->type() == QEvent::Resize)
+    // The content area (the window minus a menubar) changed: also when the window keeps its size
+    // and a menubar is shown or hidden, so the app can lay its webviews out again.
+    if (o == content && e->type() == QEvent::Resize) {
       layoutViews();
+      const double s = devicePixelRatioF();
+      Ev ev(QS_EV_WINDOW_RESIZED, id);
+      ev.e.a = phys(content->width(), s);
+      ev.e.b = phys(content->height(), s);
+      ev.fire();
+    }
     return QWidget::eventFilter(o, e);
   }
   void resizeEvent(QResizeEvent *e) override {
     QWidget::resizeEvent(e);
     layoutViews();
-    const double s = devicePixelRatioF();
-    Ev ev(QS_EV_WINDOW_RESIZED, id);
-    ev.e.a = phys(width(), s);
-    ev.e.b = phys(height(), s);
-    ev.fire();
   }
   void moveEvent(QMoveEvent *e) override {
     QWidget::moveEvent(e);
@@ -445,8 +459,8 @@ protected:
       const double s = devicePixelRatioF();
       Ev ev(QS_EV_WINDOW_SCALE, id);
       ev.e.f = s;
-      ev.e.a = phys(width(), s);
-      ev.e.b = phys(height(), s);
+      ev.e.a = phys(content->width(), s);
+      ev.e.b = phys(content->height(), s);
       ev.fire();
     }
     return QWidget::event(e);
@@ -506,11 +520,13 @@ protected:
   }
 };
 
-// Watches the view's render widget (created lazily by QWebEngineView) for file drags and for
-// presses on the edges of frameless windows (to start an interactive resize).
+// Watches the view's render widget (created lazily by QWebEngineView) for file drags, and for
+// the mouse on the edges of frameless windows: a resize cursor there, and a press starts an
+// interactive resize.
 class ViewFilter : public QObject {
 public:
   ViewFilter(QsView *v, QObject *parent) : QObject(parent), v(v) {}
+  ~ViewFilter() override { setResizeCursor({}); }
   QsView *v;
 
   void watch(QObject *o) {
@@ -544,6 +560,16 @@ protected:
       return false;
     case QEvent::MouseButtonPress:
       return onPress(w, static_cast<QMouseEvent *>(e));
+    case QEvent::MouseMove: {
+      auto *me = static_cast<QMouseEvent *>(e);
+      if (me->buttons() == Qt::NoButton)
+        setResizeCursor(resizeEdges(w, me->position().toPoint()));
+      return false;
+    }
+    case QEvent::Leave:
+    case QEvent::Hide:
+      setResizeCursor({});
+      return false;
     default:
       return false;
     }
@@ -578,23 +604,61 @@ private:
     return true;
   }
 
-  bool onPress(QWidget *w, QMouseEvent *me) {
-    QsWindow *win = v->win;
-    if (me->button() != Qt::LeftButton || !win->resizable ||
-        !(win->windowFlags() & Qt::FramelessWindowHint) || win->isMaximized() ||
-        win->isFullScreen() || !win->windowHandle())
-      return false;
-    const QPoint p = w->mapTo(win, me->position().toPoint());
+  // The window edges at `pos` (in `w`) if the window can be resized from there: a frameless,
+  // resizable window that isn't maximized or fullscreen.
+  Qt::Edges resizeEdges(QWidget *w, QPoint pos) const {
+    QsWindow *win = v ? v->win : nullptr;
+    if (!win || !win->resizable || !(win->windowFlags() & Qt::FramelessWindowHint) ||
+        win->isMaximized() || win->isFullScreen() || !win->windowHandle())
+      return {};
+    const QPoint p = w->mapTo(win, pos);
     const int border = 5;
     Qt::Edges edges;
     if (p.x() <= border) edges |= Qt::LeftEdge;
     if (p.x() >= win->width() - border) edges |= Qt::RightEdge;
     if (p.y() <= border) edges |= Qt::TopEdge;
     if (p.y() >= win->height() - border) edges |= Qt::BottomEdge;
+    return edges;
+  }
+
+  // Show the resize cursor for `edges` (none: the page's cursor again). An application override
+  // cursor, so it wins over the cursor Chromium sets on the render widget.
+  void setResizeCursor(Qt::Edges edges) {
+    const bool corner1 = edges == (Qt::TopEdge | Qt::LeftEdge) || edges == (Qt::BottomEdge | Qt::RightEdge);
+    const bool corner2 = edges == (Qt::TopEdge | Qt::RightEdge) || edges == (Qt::BottomEdge | Qt::LeftEdge);
+    const Qt::CursorShape shape = !edges                                  ? Qt::ArrowCursor
+                                  : corner1                               ? Qt::SizeFDiagCursor
+                                  : corner2                               ? Qt::SizeBDiagCursor
+                                  : edges & (Qt::LeftEdge | Qt::RightEdge) ? Qt::SizeHorCursor
+                                                                          : Qt::SizeVerCursor;
+    if (!edges) {
+      if (cursorSet) {
+        QGuiApplication::restoreOverrideCursor();
+        cursorSet = false;
+      }
+      return;
+    }
+    if (cursorSet && cursorShape == shape)
+      return;
+    if (cursorSet)
+      QGuiApplication::changeOverrideCursor(QCursor(shape));
+    else
+      QGuiApplication::setOverrideCursor(QCursor(shape));
+    cursorSet = true;
+    cursorShape = shape;
+  }
+
+  bool onPress(QWidget *w, QMouseEvent *me) {
+    if (me->button() != Qt::LeftButton)
+      return false;
+    const Qt::Edges edges = resizeEdges(w, me->position().toPoint());
     if (!edges)
       return false;
-    return win->windowHandle()->startSystemResize(edges);
+    return v->win->windowHandle()->startSystemResize(edges);
   }
+
+  bool cursorSet = false;
+  Qt::CursorShape cursorShape = Qt::ArrowCursor;
 };
 
 static const char kIpcBootstrap[] = R"JS(
@@ -861,13 +925,16 @@ void qs_window_set_visible(QsWindow *w, int visible) {
 
 void qs_window_geometry(QsWindow *w, int32_t out[8]) {
   const QRect g = w->geometry(), f = w->frameGeometry();
-  out[0] = g.x(); out[1] = g.y(); out[2] = g.width(); out[3] = g.height();
+  const int bar = w->barHeight(); // the inner area is below a menubar
+  out[0] = g.x(); out[1] = g.y() + bar; out[2] = g.width(); out[3] = g.height() - bar;
   out[4] = f.x(); out[5] = f.y(); out[6] = f.width(); out[7] = f.height();
 }
 double qs_window_scale(QsWindow *w) { return w->devicePixelRatioF(); }
 void qs_window_screen(QsWindow *w, QsScreen *out) { fillScreen(w->screen(), out); }
 
+// `width` x `height` is the inner area: a menubar comes on top of it.
 void qs_window_resize(QsWindow *w, int32_t width, int32_t height) {
+  height += w->barHeight();
   if (!w->resizable) {
     w->setFixedSize(width, height);
     return;
@@ -1059,6 +1126,24 @@ void *qs_window_qwidget(QsWindow *w) { return static_cast<QWidget *>(w); }
 void qs_window_content_size(QsWindow *w, int32_t *width, int32_t *height) {
   *width = w->content->width();
   *height = w->content->height();
+}
+
+int qs_debug_window_hover(QsWindow *w, int32_t x, int32_t y) {
+#ifdef QS_HAVE_QPA
+  QWindow *win = w->windowHandle();
+  if (!win)
+    return -2;
+  const QPointF local(x, y);
+  QWindowSystemInterface::handleMouseEvent(win, local, win->mapToGlobal(local), Qt::NoButton,
+                                           Qt::NoButton, QEvent::MouseMove);
+  QWindowSystemInterface::flushWindowSystemEvents();
+  QCoreApplication::processEvents();
+  const QCursor *c = QGuiApplication::overrideCursor();
+  return c ? int(c->shape()) : -1;
+#else
+  (void)w; (void)x; (void)y;
+  return -2;
+#endif
 }
 
 void qs_window_set_transient_for_widget(QsWindow *w, void *parent) {

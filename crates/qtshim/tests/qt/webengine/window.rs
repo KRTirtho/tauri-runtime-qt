@@ -160,8 +160,16 @@ pub fn cases() -> Vec<Case> {
       content_size_plain,
     ),
     Case::pass(
-      "window: content_size excludes a menubar",
+      "window: the inner size excludes a menubar",
       content_size_menubar,
+    ),
+    Case::pass(
+      "window: resize sets the area below a menubar, and toggling it emits Resized",
+      resize_with_menubar,
+    ),
+    Case::pass(
+      "window: the edges of a frameless window show resize cursors",
+      frameless_resize_cursor,
     ),
     Case::pass(
       "window: native_handle is None offscreen",
@@ -875,14 +883,94 @@ fn content_size_menubar() {
     let (w, h) = win.content_size();
     w == 320 && h > 0 && h < 240
   });
-  // The window keeps its client size; only the content area shrinks.
-  assert_eq!(size(&window), (320, 240));
+  // Like a native client area, the inner size is the area below the menubar (where webviews go).
+  assert_eq!(size(&window), window.content_size());
   // Removing the menubar gives the space back.
   MenuBar::remove(&window.widget());
   let win = window.clone();
   wait_for("the content to grow back", move || {
     win.content_size() == (320, 240)
   });
+}
+
+fn resize_with_menubar() {
+  init();
+  let window = shown(1, 320, 240);
+  let bar = MenuBar::get_or_create(&window.widget()).expect("menubar");
+  let _ = bar.add_menu("&File", true, None).expect("menu");
+  let win = window.clone();
+  wait_for("the menubar to take space", move || {
+    win.content_size().1 < 240
+  });
+  // Showing the bar shrank the content area: that's a resize of the inner area.
+  record_events(|_| Reply::default());
+  window.resize(400, 300);
+  let win = window.clone();
+  wait_for("the inner area to be 400x300", move || {
+    win.content_size() == (400, 300)
+  });
+  assert_eq!(size(&window), (400, 300));
+  // Hiding the bar keeps the window's size: the inner area grows and Resized reports it.
+  clear_events();
+  MenuBar::set_visible(&window.widget(), false);
+  let win = window.clone();
+  wait_for("the bar's space to be given back", move || {
+    win.content_size().1 > 300
+  });
+  let (w, h) = window.content_size();
+  let s = window.scale_factor();
+  assert!(
+    has_event(|e| e.kind == EventKind::WindowResized && e.a == phys(w, s) && e.b == phys(h, s)),
+    "no Resized for {w}x{h}: {:?}",
+    events()
+  );
+}
+
+fn frameless_resize_cursor() {
+  // Qt::CursorShape values
+  const SIZE_HOR: i32 = 6;
+  const SIZE_FDIAG: i32 = 8;
+  init();
+  let window = shown(1, 400, 300);
+  window.set_flag(WindowFlag::Decorations, false);
+  let view = Rc::new(View::new(
+    1,
+    &window,
+    Profile::get(None, true),
+    ViewOptions {
+      fill: true,
+      ..Default::default()
+    },
+  ));
+  view.load_html("<body style='margin:0'><p>page</p></body>", None);
+  let v = view.clone();
+  wait_for("the page to render", move || {
+    v.url().starts_with("data:") || v.url() == "about:blank" || !v.url().is_empty()
+  });
+  pump(Duration::from_millis(500));
+  let Ok(edge) = window.debug_hover(1, 150) else {
+    eprintln!("no QPA headers: skipped");
+    return;
+  };
+  assert_eq!(edge, Some(SIZE_HOR), "left edge");
+  assert_eq!(
+    window.debug_hover(1, 1).unwrap(),
+    Some(SIZE_FDIAG),
+    "top-left corner"
+  );
+  assert_eq!(
+    window.debug_hover(200, 150).unwrap(),
+    None,
+    "middle: the page's cursor"
+  );
+  // A decorated window resizes through its frame: no cursor of ours.
+  window.set_flag(WindowFlag::Decorations, true);
+  pump(Duration::from_millis(200));
+  assert_eq!(
+    window.debug_hover(1, 150).unwrap(),
+    None,
+    "decorated window"
+  );
 }
 
 fn native_handle_offscreen() {

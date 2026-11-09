@@ -250,6 +250,7 @@ unsafe extern "C" {
   pub fn qs_window_native(w: *mut QsWindow, kind: *mut c_int, handle: *mut *mut c_void) -> c_int;
   pub fn qs_window_qwidget(w: *mut QsWindow) -> *mut c_void;
   pub fn qs_window_content_size(w: *mut QsWindow, width: *mut i32, height: *mut i32);
+  pub fn qs_debug_window_hover(w: *mut QsWindow, x: i32, y: i32) -> c_int;
   pub fn qs_window_set_transient_for_widget(w: *mut QsWindow, parent: *mut c_void);
 
   pub fn qs_profile_get(dir: *const c_char, incognito: c_int) -> *mut QsProfile;
