@@ -93,10 +93,29 @@ the normal Tauri APIs work unchanged: `Builder::menu`, `Window::set_menu` / `rem
 - `WebviewWindowBuilder::parent` / `transient_for` no longer fail: the new window is made
   transient for the parent's Qt window (`QWindow::setTransientParent`).
 
-This needs changes that aren't released yet: muda's `qt` backend (`../muda`, branch
-`qt-backend`, based on muda 0.20.0) and `tauri`'s `qt` feature plus
-`WindowDispatch::qt_window` (`../tauri`, branch `qt-support`, based on Tauri v3). The workspace
-`Cargo.toml` patches both in from those sibling checkouts.
+This needs changes that aren't released yet: muda's `qt` backend
+([KRTirtho/muda](https://github.com/KRTirtho/muda), branch `qt-backend`, based on muda 0.20.0)
+and `tauri`'s `qt` feature plus `WindowDispatch::qt_window`
+([KRTirtho/tauri](https://github.com/KRTirtho/tauri), branch `qt-support`, based on Tauri v3).
+The workspace `Cargo.toml` patches both in from GitHub; an app using this runtime does the same:
+
+```toml
+[dependencies]
+tauri = "3.0.0-alpha.6"
+tauri-runtime-qt = { git = "https://github.com/KRTirtho/tauri-runtime-qt", branch = "main" }
+
+[patch.crates-io]
+tauri = { git = "https://github.com/KRTirtho/tauri", branch = "qt-support" }
+tauri-runtime = { git = "https://github.com/KRTirtho/tauri", branch = "qt-support" }
+tauri-utils = { git = "https://github.com/KRTirtho/tauri", branch = "qt-support" }
+tauri-macros = { git = "https://github.com/KRTirtho/tauri", branch = "qt-support" }
+tauri-codegen = { git = "https://github.com/KRTirtho/tauri", branch = "qt-support" }
+tauri-build = { git = "https://github.com/KRTirtho/tauri", branch = "qt-support" }
+muda = { git = "https://github.com/KRTirtho/muda", branch = "qt-backend" }
+```
+
+Keep `branch = "main"` on `tauri-runtime-qt`: muda's Qt backend takes `qtshim` from the same
+branch, and two sources of it would link the `qtshim` library twice.
 
 ## How it works
 

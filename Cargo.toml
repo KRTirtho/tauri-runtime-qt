@@ -12,12 +12,18 @@ members = [
 ]
 
 # Qt menus need `tauri`'s `qt` feature and muda's Qt backend, which aren't released yet:
-# build against local checkouts (../tauri on branch `qt-support`, ../muda on `qt-backend`).
+# build against the forks (KRTirtho/tauri on branch `qt-support`, KRTirtho/muda on `qt-backend`).
 [patch.crates-io]
-tauri = { path = "../tauri/crates/tauri" }
-tauri-runtime = { path = "../tauri/crates/tauri-runtime" }
-tauri-utils = { path = "../tauri/crates/tauri-utils" }
-tauri-macros = { path = "../tauri/crates/tauri-macros" }
-tauri-codegen = { path = "../tauri/crates/tauri-codegen" }
-tauri-build = { path = "../tauri/crates/tauri-build" }
-muda = { path = "../muda" }
+tauri = { git = "https://github.com/KRTirtho/tauri", branch = "qt-support" }
+tauri-runtime = { git = "https://github.com/KRTirtho/tauri", branch = "qt-support" }
+tauri-utils = { git = "https://github.com/KRTirtho/tauri", branch = "qt-support" }
+tauri-macros = { git = "https://github.com/KRTirtho/tauri", branch = "qt-support" }
+tauri-codegen = { git = "https://github.com/KRTirtho/tauri", branch = "qt-support" }
+tauri-build = { git = "https://github.com/KRTirtho/tauri", branch = "qt-support" }
+muda = { git = "https://github.com/KRTirtho/muda", branch = "qt-backend" }
+
+# muda takes qtshim from this repository on GitHub: here it is this workspace's own (one `qtshim` native library).
+[patch."https://github.com/KRTirtho/tauri-runtime-qt"]
+qtshim = { path = "crates/qtshim" }
+qtshim-sys = { path = "crates/qtshim-sys" }
+qt-test-harness = { path = "crates/qt-test-harness" }
