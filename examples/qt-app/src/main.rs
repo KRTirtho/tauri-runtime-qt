@@ -538,6 +538,7 @@ fn wav(seconds: u32) -> Vec<u8> {
 /// - `/echo`: JSON with the method, body length/checksum and the `x-test` header
 /// - `/bytes?n=N`: N bytes, byte i = i % 251
 /// - `/redirect`: a 302 to `/echo`
+/// - `/status?c=N`: status N with the body `status N`
 /// - `/missing`: an empty 404
 fn async_protocol(
   _ctx: tauri::UriSchemeContext<'_, R>,
@@ -578,6 +579,18 @@ fn async_protocol(
         builder
           .header("Content-Type", "application/octet-stream")
           .body((0..n).map(|i| (i % 251) as u8).collect())
+          .unwrap()
+      }
+      "/status" => {
+        let code = uri
+          .query()
+          .and_then(|q| q.strip_prefix("c="))
+          .and_then(|n| n.parse::<u16>().ok())
+          .unwrap_or(200);
+        builder
+          .status(code)
+          .header("Content-Type", "text/plain")
+          .body(format!("status {code}").into_bytes())
           .unwrap()
       }
       "/redirect" => builder

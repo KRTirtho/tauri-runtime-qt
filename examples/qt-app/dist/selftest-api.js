@@ -589,10 +589,31 @@ window.tauriApiChecks = async function ({ check, knownBug, assert, skip, sleep, 
     assert(json.query === 'redirected=1', JSON.stringify(json));
     return `${r.url} -> ${JSON.stringify(json)}`;
   });
-  await check('protocol: empty 404 is a network error', async () => {
-    let r;
-    try { r = await fetch(asyncUrl('missing')); } catch (e) { return 'rejected: ' + e; }
-    throw new Error(`fetch resolved: ${r.status} ${r.statusText} body "${await r.text()}"`);
+  await check('protocol: empty 404 resolves with status 404', async () => {
+    const r = await fetch(asyncUrl('missing'));
+    const body = await r.text();
+    assert(r.status === 404 && !r.ok && r.statusText === 'Not Found' && body === '',
+      `${r.status} ${r.ok} ${r.statusText} "${body}"`);
+    return `${r.status} ${r.statusText}`;
+  });
+  await check('protocol: status codes reach fetch and XHR', async () => {
+    const out = [];
+    for (const code of [201, 404, 418, 500, 503]) {
+      const r = await fetch(asyncUrl('status') + '?c=' + code);
+      const body = await r.text();
+      assert(r.status === code && r.ok === (code < 300) && body === 'status ' + code,
+        `${code}: ${r.status} ${r.ok} "${body}"`);
+      const x = await new Promise((ok, err) => {
+        const x = new XMLHttpRequest();
+        x.open('GET', asyncUrl('status') + '?c=' + code);
+        x.onload = () => ok(x);
+        x.onerror = err;
+        x.send();
+      });
+      assert(x.status === code, `xhr ${code}: ${x.status}`);
+      out.push(`${code} ${r.statusText}`);
+    }
+    return out.join(', ');
   });
   async function ranges(list) {
     const url = convertFileSrc('data', 'stream');
